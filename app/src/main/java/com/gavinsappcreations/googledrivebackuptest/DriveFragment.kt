@@ -39,7 +39,7 @@ import kotlinx.coroutines.tasks.await
 
 class DriveFragment : Fragment() {
 
-    var rootDirectoryDocumentFile: DocumentFile? = null
+    var backupDirectoryDocumentFile: DocumentFile? = null
 
     private val viewModel by viewModels<DriveViewModel>()
     private lateinit var binding: FragmentDriveBinding
@@ -70,14 +70,12 @@ class DriveFragment : Fragment() {
                     val uri = result.data!!.data
                     updateRootDirectoryUri(uri!!)
                     requireActivity().getPreferences(Context.MODE_PRIVATE).edit()
-                        .putString(KEY_ROOT_DIRECTORY_URI, uri.toString()).apply()
+                        .putString(KEY_BACKUP_DIRECTORY_URI, backupDirectoryDocumentFile!!.uri.toString()).apply()
                     requireActivity().contentResolver.takePersistableUriPermission(
                         uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
                     )
 
-                    // TODO: check if this exists before creating it
-                    rootDirectoryDocumentFile = rootDirectoryDocumentFile?.createDirectory("my_backup_directory")
-                    viewModel.updateRootDirectoryUri(uri)
+                    viewModel.updateRootDirectoryUri(backupDirectoryDocumentFile!!.uri)
                 } else {
                     Toast.makeText(requireActivity(), "permissions request cancelled", Toast.LENGTH_SHORT).show()
                 }
@@ -100,7 +98,7 @@ class DriveFragment : Fragment() {
         }
 
         binding.backupButton.setOnClickListener {
-            rootDirectoryDocumentFile?.let {
+            backupDirectoryDocumentFile?.let {
                 copyFilesFromGoogleDriveToLocalDirectory()
             }
         }
@@ -127,7 +125,7 @@ class DriveFragment : Fragment() {
 
     private fun fetchStoredRootDirectoryUri(): Uri? {
         val uriString = requireActivity().getPreferences(Context.MODE_PRIVATE)
-            .getString(KEY_ROOT_DIRECTORY_URI, null)
+            .getString(KEY_BACKUP_DIRECTORY_URI, null)
 
         uriString?.let {
             return Uri.parse(uriString)
@@ -138,7 +136,8 @@ class DriveFragment : Fragment() {
 
     private fun updateRootDirectoryUri(uri: Uri?) {
         uri?.let {
-            rootDirectoryDocumentFile = DocumentFile.fromTreeUri(requireActivity(), uri)
+            // TODO: check that this directory exists before creating it
+            backupDirectoryDocumentFile = DocumentFile.fromTreeUri(requireActivity(), uri)!!.createDirectory(BACKUP_SUBDIRECTORY)
             viewModel.updateRootDirectoryUri(uri)
         }
     }
@@ -194,16 +193,25 @@ class DriveFragment : Fragment() {
                     }.execute()
 
                     for (file: File in result.files) {
+
+                        (file.name).print()
+                        (file.mimeType).print()
+
+                        // TODO: For now we're just skipping over files from Google Apps since they need to be handled differently
+                        if (file.mimeType.startsWith(GOOGLE_APP_FILE_MIME_TYPE_PREFIX)) {
+                            continue
+                        }
+
                         when (file.isDirectory()) {
                             true -> {
                                 if (file.parents != null && file.parents.size != 0) {
                                     val test: String = file.parents[0]
                                     (test).print()
                                 }
-                                rootDirectoryDocumentFile!!.createDirectory(file.name)
+                                backupDirectoryDocumentFile!!.createDirectory(file.name)
                             }
                             false -> {
-                                val currentDocumentFile = rootDirectoryDocumentFile!!.createFile(file.mimeType, file.name)
+                                val currentDocumentFile = backupDirectoryDocumentFile!!.createFile(file.mimeType, file.name)
                                 currentDocumentFile?.let {
                                     val outputStream = requireActivity().contentResolver.openOutputStream(currentDocumentFile.uri)!!
                                     //googleDriveService.files().export() // Use this instead for Google Docs files
@@ -291,10 +299,16 @@ class DriveFragment : Fragment() {
 
     companion object {
         const val TAG_KOTLIN = "TAG_KOTLIN"
-        private const val KEY_ROOT_DIRECTORY_URI = "root-uri"
+        private const val KEY_BACKUP_DIRECTORY_URI = "backup-uri"
 
         private const val DRIVE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
+        private const val GOOGLE_DOC_FILE_MIME_TYPE = "application/vnd.google-apps.document"
+
+        private const val GOOGLE_APP_FILE_MIME_TYPE_PREFIX = "application/vnd.google-apps"
+
         private const val UNKNOWN_FILE_MIME_TYPE = "application/octet-stream"
+
+        private const val BACKUP_SUBDIRECTORY = "my_backup_directory"
     }
 }
 
