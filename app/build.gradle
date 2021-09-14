@@ -1,3 +1,4 @@
+
 plugins {
     id 'com.android.application'
     id 'kotlin-android'
@@ -67,12 +68,22 @@ dependencies {
     implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:$version_kotlin_coroutines"
     implementation "org.jetbrains.kotlinx:kotlinx-coroutines-play-services:$version_kotlin_coroutines"
 
-    // Google Drive API
-    implementation('com.google.api-client:google-api-client-android:1.32.1')
-    implementation('com.google.apis:google-api-services-drive:v3-rev20210725-1.32.1')
+    // Google Sign In
+    implementation('com.google.api-client:google-api-client-android:1.32.1') {
+        exclude group: 'org.apache.httpcomponents'
+        exclude module: 'guava-jdk5'
+    }
+
+    // Google Drive
+    implementation('com.google.apis:google-api-services-drive:v3-rev136-1.25.0') {
+        exclude group: 'org.apache.httpcomponents'
+        exclude module: 'guava-jdk5'
+    }
+
 
     // Google Auth
     implementation 'com.google.android.gms:play-services-auth:19.2.0'
+
 
     // Not currently used
     testImplementation 'junit:junit:4.13.2'

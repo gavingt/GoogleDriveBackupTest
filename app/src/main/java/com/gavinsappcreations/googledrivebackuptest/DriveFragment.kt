@@ -1,27 +1,45 @@
 package com.gavinsappcreations.googledrivebackuptest
 
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Toast
-import androidx.activity.result.ActivityResult
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.databinding.DataBindingUtil
+import androidx.documentfile.provider.DocumentFile
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.viewModels
+import androidx.lifecycle.asLiveData
+import androidx.lifecycle.lifecycleScope
 import com.gavinsappcreations.googledrivebackuptest.databinding.FragmentDriveBinding
 import com.google.android.gms.auth.api.signin.GoogleSignIn
 import com.google.android.gms.auth.api.signin.GoogleSignInClient
 import com.google.android.gms.auth.api.signin.GoogleSignInOptions
 import com.google.android.gms.common.api.ApiException
+import com.google.android.gms.common.api.Scope
+import com.google.api.client.googleapis.extensions.android.gms.auth.GoogleAccountCredential
+import com.google.api.client.http.javanet.NetHttpTransport
+import com.google.api.client.json.jackson2.JacksonFactory
+import com.google.api.services.drive.Drive
+import com.google.api.services.drive.DriveScopes
+import com.google.api.services.drive.model.File
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
 
+// TODO: Fix case when internet cuts out in middle of an operation
+// TODO: Cache a map of folder_id => folder_name
 
 class DriveFragment : Fragment() {
+
+    var rootDirectoryDocumentFile: DocumentFile? = null
 
     private val viewModel by viewModels<DriveViewModel>()
     private lateinit var binding: FragmentDriveBinding
@@ -38,12 +56,36 @@ class DriveFragment : Fragment() {
         binding.viewModel = viewModel
 
         // Here we define what to do with the sign-in result.
-        val googleSignInResultLauncher: ActivityResultLauncher<Intent> = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result: ActivityResult ->
-            if (result.resultCode == Activity.RESULT_OK) {
-                val data: Intent? = result.data
-                handleSignInData(data)
+        val googleSignInResultLauncher: ActivityResultLauncher<Intent> =
+            registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+                if (result.resultCode == Activity.RESULT_OK) {
+                    val data: Intent? = result.data
+                    handleSignInData(data)
+                }
             }
-        }
+
+        val permissionsLauncher: ActivityResultLauncher<Intent> =
+            registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+                if (result.resultCode == Activity.RESULT_OK) {
+                    val uri = result.data!!.data
+                    updateRootDirectoryUri(uri!!)
+                    requireActivity().getPreferences(Context.MODE_PRIVATE).edit()
+                        .putString(KEY_ROOT_DIRECTORY_URI, uri.toString()).apply()
+                    requireActivity().contentResolver.takePersistableUriPermission(
+                        uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    )
+
+                    // TODO: check if this exists before creating it
+                    rootDirectoryDocumentFile = rootDirectoryDocumentFile?.createDirectory("my_backup_directory")
+                    viewModel.updateRootDirectoryUri(uri)
+                } else {
+                    Toast.makeText(requireActivity(), "permissions request cancelled", Toast.LENGTH_SHORT).show()
+                }
+            }
+
+        updateRootDirectoryUri(fetchStoredRootDirectoryUri())
+
+        updateUserGoogleSignInStatus()
 
         binding.logInButton.setOnClickListener {
             startGoogleSignIn(googleSignInResultLauncher)
@@ -53,7 +95,136 @@ class DriveFragment : Fragment() {
             signOut()
         }
 
+        binding.grantUsbPermissionsButton.setOnClickListener {
+            promptForPermissionsInSAF(permissionsLauncher)
+        }
+
+        binding.backupButton.setOnClickListener {
+            rootDirectoryDocumentFile?.let {
+                copyFilesFromGoogleDriveToLocalDirectory()
+            }
+        }
+
         return binding.root
+    }
+
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+
+        viewModel.viewState.asLiveData().observe(viewLifecycleOwner) {
+            binding.logInButton.isEnabled = !it.isUserSignedIn
+            binding.logOutButton.isEnabled = it.isUserSignedIn
+            binding.backupButton.isEnabled = it.isUserSignedIn && it.rootDirectoryUri != null
+            binding.restoreButton.isEnabled = it.isUserSignedIn && it.rootDirectoryUri != null
+
+            binding.grantUsbPermissionsButton.text = when (it.rootDirectoryUri) {
+                null -> "Grant USB drive permissions"
+                else -> "Grant USB drive permissions for different directory"
+            }
+        }
+    }
+
+    private fun fetchStoredRootDirectoryUri(): Uri? {
+        val uriString = requireActivity().getPreferences(Context.MODE_PRIVATE)
+            .getString(KEY_ROOT_DIRECTORY_URI, null)
+
+        uriString?.let {
+            return Uri.parse(uriString)
+        }
+        return null
+    }
+
+
+    private fun updateRootDirectoryUri(uri: Uri?) {
+        uri?.let {
+            rootDirectoryDocumentFile = DocumentFile.fromTreeUri(requireActivity(), uri)
+            viewModel.updateRootDirectoryUri(uri)
+        }
+    }
+
+
+    private fun updateUserGoogleSignInStatus() {
+        viewModel.updateUserGoogleSignInStatus(GoogleSignIn.getLastSignedInAccount(requireActivity()) != null)
+    }
+
+
+    private fun promptForPermissionsInSAF(resultLauncher: ActivityResultLauncher<Intent>) {
+        val permissionIntent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+        permissionIntent.addFlags(
+            Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                    or Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
+        )
+        resultLauncher.launch(permissionIntent)
+    }
+
+
+    private fun getDriveService(): Drive? {
+        GoogleSignIn.getLastSignedInAccount(requireActivity())?.let { googleAccount ->
+            val credential = GoogleAccountCredential.usingOAuth2(
+                requireActivity(), listOf(DriveScopes.DRIVE)
+            )
+
+            credential.selectedAccount = googleAccount.account!!
+            return Drive.Builder(
+                NetHttpTransport(),
+                JacksonFactory.getDefaultInstance(),
+                credential
+            )
+                .setApplicationName(getString(R.string.app_name))
+                .build()
+        }
+        return null
+    }
+
+
+    private fun copyFilesFromGoogleDriveToLocalDirectory() {
+
+        getDriveService()?.let { googleDriveService ->
+
+            lifecycleScope.launch(Dispatchers.IO) {
+                var pageToken: String? = null
+                do {
+                    val result = googleDriveService.files().list().apply {
+                        spaces = "drive"
+                        fields = "nextPageToken, files(id, name, mimeType)"
+                        this.pageToken = pageToken
+                    }.execute()
+
+                    for (file: File in result.files) {
+                        when (file.isDirectory()) {
+                            true -> {
+                                if (file.parents != null && file.parents.size != 0) {
+                                    val test: String = file.parents[0]
+                                    (test).print()
+                                }
+                                rootDirectoryDocumentFile!!.createDirectory(file.name)
+                            }
+                            false -> {
+                                val currentDocumentFile = rootDirectoryDocumentFile!!.createFile(file.mimeType, file.name)
+                                currentDocumentFile?.let {
+                                    val outputStream = requireActivity().contentResolver.openOutputStream(currentDocumentFile.uri)!!
+                                    //googleDriveService.files().export() // Use this instead for Google Docs files
+                                    googleDriveService.files().get(file.id).executeMediaAndDownloadTo(outputStream)
+                                    outputStream.close()
+                                }
+                            }
+                        }
+                    }
+                    pageToken = result.nextPageToken
+                } while (pageToken != null)
+            }
+        }
+    }
+
+
+    private fun File.isDirectory() = mimeType == DRIVE_FOLDER_MIME_TYPE
+
+
+    private fun copyFilesFromLocalDirectoryToGoogleDrive() {
+        // https://commonsware.com/blog/2019/11/09/scoped-storage-stories-trees.html
     }
 
 
@@ -62,45 +233,36 @@ class DriveFragment : Fragment() {
          * Configure sign-in to request the user's ID, email address, and basic
          * profile. ID and basic profile are included in DEFAULT_SIGN_IN.
          */
-        val gso = GoogleSignInOptions
+        val signInOptions = GoogleSignInOptions
             .Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
             .requestEmail()
             .requestProfile()
+            // Ask for permission to modify everything on user's Drive.
+            // TODO: only request scope needed for current task - DRIVE for writing and DRIVE_READONLY for reading
+            .requestScopes(Scope(DriveScopes.DRIVE))
             .build()
 
 
-        /**
-         * Build a GoogleSignInClient with the options specified by gso.
-         */
-        return GoogleSignIn.getClient(requireActivity(), gso);
+        // Build a GoogleSignInClient with the options specified by our signInOptions object.
+        return GoogleSignIn.getClient(requireActivity(), signInOptions);
     }
 
     private fun startGoogleSignIn(resultLauncher: ActivityResultLauncher<Intent>) {
-
-        if (!isUserSignedIn()) {
-            val signInIntent = getGoogleSignInClient().signInIntent
-            resultLauncher.launch(signInIntent)
-        } else {
-            Toast.makeText(requireActivity(), "User already signed in", Toast.LENGTH_SHORT).show()
-        }
-
+        val signInIntent = getGoogleSignInClient().signInIntent
+        resultLauncher.launch(signInIntent)
     }
 
-    private fun isUserSignedIn(): Boolean {
-
-        val account = GoogleSignIn.getLastSignedInAccount(requireActivity())
-        return account != null
-
-    }
 
     private fun signOut() {
-        if (isUserSignedIn()) {
-            getGoogleSignInClient().signOut().addOnCompleteListener {
-                if (it.isSuccessful) {
-                    Toast.makeText(requireActivity(), " Signed out ", Toast.LENGTH_SHORT).show()
-                } else {
-                    Toast.makeText(requireActivity(), " Error ", Toast.LENGTH_SHORT).show()
-                }
+        lifecycleScope.launch {
+            try {
+                val signOutTask = getGoogleSignInClient().signOut()
+                signOutTask.await()
+                // Successfully signed out.
+                updateUserGoogleSignInStatus()
+                Toast.makeText(requireActivity(), " Signed out ", Toast.LENGTH_SHORT).show()
+            } catch (throwable: Throwable) {
+                Toast.makeText(requireActivity(), " Error ", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -112,9 +274,11 @@ class DriveFragment : Fragment() {
             val account = getAccountTask.getResult(ApiException::class.java)
 
             // User signed in successfully.
+            updateUserGoogleSignInStatus()
             "account ${account.account}".print()
             "displayName ${account.displayName}".print()
             "Email ${account.email}".print()
+            "Scopes granted ${account.grantedScopes}".print()
         } catch (e: ApiException) {
             // The ApiException status code indicates the detailed failure reason.
             // Please refer to the GoogleSignInStatusCodes class reference for more information.
@@ -127,10 +291,14 @@ class DriveFragment : Fragment() {
 
     companion object {
         const val TAG_KOTLIN = "TAG_KOTLIN"
+        private const val KEY_ROOT_DIRECTORY_URI = "root-uri"
+
+        private const val DRIVE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
+        private const val UNKNOWN_FILE_MIME_TYPE = "application/octet-stream"
     }
 }
 
 
 fun Any.print() {
-    Log.v(DriveFragment.TAG_KOTLIN, " $this")
+    Log.d(DriveFragment.TAG_KOTLIN, " $this")
 }
