@@ -33,6 +33,7 @@ import com.google.api.services.drive.model.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withContext
 
 // TODO: Use WorkManager to disconnect the backup/restore processes from the UI.
 // TODO: Use different OutputStream? Maybe others allow resuming downloads or have less overhead
@@ -40,6 +41,7 @@ import kotlinx.coroutines.tasks.await
 
 // TODO: add logs for everything
 // TODO: Use this instead backing up Google Docs files: googleDriveService.files().export()
+// TODO: check if we already have a file/directory before downloading it
 
 class DriveFragment : Fragment() {
 
@@ -116,7 +118,8 @@ class DriveFragment : Fragment() {
             binding.logInButton.isEnabled = !state.isUserSignedIn
             binding.logOutButton.isEnabled = state.isUserSignedIn
             binding.backupButton.isEnabled = state.isUserSignedIn && state.rootDirectoryUri != null
-            binding.restoreButton.isEnabled = state.isUserSignedIn && state.rootDirectoryUri != null
+            // TODO: remove hard-coded "false" before working on restore feature
+            binding.restoreButton.isEnabled = false /*state.isUserSignedIn && state.rootDirectoryUri != null*/
 
             binding.grantUsbPermissionsButton.text = when (state.rootDirectoryUri) {
                 null -> "Grant USB drive permissions"
@@ -152,7 +155,10 @@ class DriveFragment : Fragment() {
         return null
     }
 
-    // Returns boolean indicating whether the provided tree Uri points to a directory that actually exists.
+
+    /**
+     * Returns boolean indicating whether the provided tree Uri points to a directory that actually exists.
+     */
     private fun fileForDocumentTreeUriExists(documentTreeUri: Uri) =
         DocumentFile.fromTreeUri(requireActivity(), documentTreeUri)?.exists() ?: false
 
@@ -207,7 +213,6 @@ class DriveFragment : Fragment() {
 
 
     private fun copyFilesFromGoogleDriveToLocalDirectory() {
-
         val backupDirectoryDocumentFile = getOrCreateFolder(rootDirectoryDocumentFile!!, BACKUP_DIRECTORY)
 
         getDriveService()?.let { googleDriveService ->
@@ -221,14 +226,14 @@ class DriveFragment : Fragment() {
                         this.pageToken = pageToken
                     }.execute()
 
-                    for (file: File in result.files) {
-
+                    // For loop with index
+                    for ((index, file) in result.files.withIndex()) {
                         (file.name).print()
                         (file.mimeType).print()
                         (file.parents ?: "null").print()
 
                         // TODO: For now we're just skipping over files from Google Apps since they need to be handled differently
-                        if (file.mimeType.startsWith(GOOGLE_APP_FILE_MIME_TYPE_PREFIX)) {
+                        if (file.mimeType != DRIVE_FOLDER_MIME_TYPE && file.mimeType.startsWith(GOOGLE_APP_FILE_MIME_TYPE_PREFIX)) {
                             continue
                         }
 
@@ -251,11 +256,22 @@ class DriveFragment : Fragment() {
                                 }
                             }
                         }
+
+                        // Temporarily switch back to main thread to update UI
+                        withContext(Dispatchers.Main) {
+                            setBackupButtonText(index, result.files.size)
+                        }
                     }
                     pageToken = result.nextPageToken
                 } while (pageToken != null)
             }
         }
+    }
+
+
+    private fun setBackupButtonText(numFilesDownloaded: Int, numFilesTotal: Int) {
+        val suffix = "\nFiles downloaded: ${numFilesDownloaded}/${numFilesTotal}"
+        binding.backupButton.text = requireActivity().getString(R.string.backup_button_text, suffix)
     }
 
 
