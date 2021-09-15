@@ -3,7 +3,6 @@ package com.gavinsappcreations.googledrivebackuptest
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
-import android.content.UriPermission
 import android.net.Uri
 import android.os.Bundle
 import android.util.Log
@@ -35,12 +34,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 
-// TODO: Fix case when internet cuts out in middle of an operation (WorkManager?
+// TODO: Use WorkManager to disconnect the backup/restore processes from the UI.
 // TODO: Use different OutputStream? Maybe others allow resuming downloads or have less overhead
-// TODO: Cache a map of folder_id => folder_name or similar to preserve hierarchy. Or use this?: val map: Pair<DocumentFile?, String> = rootDirectoryDocumentFile.to("directoryName")
+// TODO: Store a map of Pair<folder_id, folder_name> or similar to document hierarchy. Use this to set Pairs: rootDirectoryDocumentFile.to("directoryName")
 
 // TODO: add logs for everything
-// TODO: Use this instead backing up Google Docs files:  googleDriveService.files().export()
+// TODO: Use this instead backing up Google Docs files: googleDriveService.files().export()
 
 class DriveFragment : Fragment() {
 
@@ -58,7 +57,7 @@ class DriveFragment : Fragment() {
         binding.lifecycleOwner = viewLifecycleOwner
         binding.viewModel = viewModel
 
-        // Here we define what to do with the sign-in result.
+        // Here we specify what to do with the Google sign-in result.
         val googleSignInResultLauncher: ActivityResultLauncher<Intent> =
             registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
                 if (result.resultCode == Activity.RESULT_OK) {
@@ -67,6 +66,7 @@ class DriveFragment : Fragment() {
                 }
             }
 
+        // Here we specify what to do with the Uri permission result.
         val permissionsLauncher: ActivityResultLauncher<Intent> =
             registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
                 if (result.resultCode == Activity.RESULT_OK) {
@@ -77,15 +77,13 @@ class DriveFragment : Fragment() {
                     requireActivity().contentResolver.takePersistableUriPermission(
                         uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
                     )
-
                     viewModel.updateRootDirectoryUri(rootDirectoryDocumentFile!!.uri)
                 } else {
                     Toast.makeText(requireActivity(), "permissions request cancelled", Toast.LENGTH_SHORT).show()
                 }
             }
 
-        updateRootDirectoryUri(fetchPersistedRootDirectoryUri())
-
+        updateRootDirectoryUri(verifyAndFetchRootDirectoryUri())
         updateUserGoogleSignInStatus()
 
         binding.logInButton.setOnClickListener {
@@ -113,37 +111,50 @@ class DriveFragment : Fragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
 
-        viewModel.viewState.asLiveData().observe(viewLifecycleOwner) {
-            binding.logInButton.isEnabled = !it.isUserSignedIn
-            binding.logOutButton.isEnabled = it.isUserSignedIn
-            binding.backupButton.isEnabled = it.isUserSignedIn && it.rootDirectoryUri != null
-            binding.restoreButton.isEnabled = it.isUserSignedIn && it.rootDirectoryUri != null
+        // Here we observe and react to changes in our view's state, which is stored in our ViewModel.
+        viewModel.viewState.asLiveData().observe(viewLifecycleOwner) { state ->
+            binding.logInButton.isEnabled = !state.isUserSignedIn
+            binding.logOutButton.isEnabled = state.isUserSignedIn
+            binding.backupButton.isEnabled = state.isUserSignedIn && state.rootDirectoryUri != null
+            binding.restoreButton.isEnabled = state.isUserSignedIn && state.rootDirectoryUri != null
 
-            binding.grantUsbPermissionsButton.text = when (it.rootDirectoryUri) {
+            binding.grantUsbPermissionsButton.text = when (state.rootDirectoryUri) {
                 null -> "Grant USB drive permissions"
-                else -> "Grant USB drive permissions for different directory"
+                else -> {
+                    when (rootDirectoryDocumentFile) {
+                        null -> "Grant backup directory permissions"
+                        else -> "Current backup directory: \n/${rootDirectoryDocumentFile!!.name}"
+                    }
+                }
             }
         }
     }
 
-     /**
-      * Returns the most recent Uri the user granted us permission to,
-      *  or null if user hasn't yet chosen a directory or if the permission has been revoked.
-      */
-    private fun fetchPersistedRootDirectoryUri(): Uri? {
-        val mostRecentlyGrantedUriString = requireActivity().getPreferences(Context.MODE_PRIVATE)
-            .getString(KEY_ROOT_DIRECTORY_URI, null)
+    /**
+     * Returns the most recent Uri the user granted us permission to.
+     * Alternatively, returns null if user hasn't yet chosen a directory,
+     * the chosen directory has been deleted, or the Uri permission has been revoked.
+     */
+    private fun verifyAndFetchRootDirectoryUri(): Uri? {
+        val savedUriString = requireActivity().getPreferences(Context.MODE_PRIVATE)
+            .getString(KEY_ROOT_DIRECTORY_URI, null) ?: return null
 
-        mostRecentlyGrantedUriString?.let {
-            val previouslyGrantedPermissions: MutableList<UriPermission> = requireActivity().contentResolver.persistedUriPermissions
-            previouslyGrantedPermissions.map {
-                if (it.uri.toString() == mostRecentlyGrantedUriString) {
-                    return Uri.parse(mostRecentlyGrantedUriString)
-                }
+        val persistedUriPermissions = requireActivity().contentResolver.persistedUriPermissions
+
+        // Iterate through persistedUriPermissions list to find one that matches our conditions.
+        persistedUriPermissions.map { uriPermission ->
+            val savedUriMatchesPersistedUri = uriPermission.uri.toString() == savedUriString
+            val persistedUri = Uri.parse(savedUriString)
+            if (savedUriMatchesPersistedUri && fileForDocumentTreeUriExists(persistedUri)) {
+                return persistedUri
             }
         }
         return null
     }
+
+    // Returns boolean indicating whether the provided tree Uri points to a directory that actually exists.
+    private fun fileForDocumentTreeUriExists(documentTreeUri: Uri) =
+        DocumentFile.fromTreeUri(requireActivity(), documentTreeUri)?.exists() ?: false
 
 
     private fun updateRootDirectoryUri(uri: Uri?) {
@@ -206,7 +217,7 @@ class DriveFragment : Fragment() {
                 do {
                     val result = googleDriveService.files().list().apply {
                         spaces = "drive"
-                        fields = "nextPageToken, files(id, name, mimeType)"
+                        fields = "nextPageToken, files(id, name, mimeType, parents)"
                         this.pageToken = pageToken
                     }.execute()
 
@@ -214,6 +225,7 @@ class DriveFragment : Fragment() {
 
                         (file.name).print()
                         (file.mimeType).print()
+                        (file.parents ?: "null").print()
 
                         // TODO: For now we're just skipping over files from Google Apps since they need to be handled differently
                         if (file.mimeType.startsWith(GOOGLE_APP_FILE_MIME_TYPE_PREFIX)) {
@@ -233,7 +245,6 @@ class DriveFragment : Fragment() {
                                 // TODO: call createFile() on proper directory, not always backupDirectory
                                 val currentDocumentFile = backupDirectoryDocumentFile!!.createFile(file.mimeType, file.name)
                                 currentDocumentFile?.let {
-
                                     val outputStream = requireActivity().contentResolver.openOutputStream(currentDocumentFile.uri)!!
                                     googleDriveService.files().get(file.id).executeMediaAndDownloadTo(outputStream)
                                     outputStream.close()
@@ -254,31 +265,27 @@ class DriveFragment : Fragment() {
     private fun copyFilesFromLocalDirectoryToGoogleDrive() {
         // https://developers.google.com/drive/api/v3/folder
         // https://commonsware.com/blog/2019/11/09/scoped-storage-stories-trees.html
+
+/*        We can call file.parents = ... to set a file's parents directly:
+        val file = File()
+        file.parents = listOf("idOfParent1", "idOfParent2")*/
     }
 
+    // Uses https://developers.google.com/identity/sign-in/android/start
+    private fun startGoogleSignIn(resultLauncher: ActivityResultLauncher<Intent>) {
+        val signInIntent = getGoogleSignInClient().signInIntent
+        resultLauncher.launch(signInIntent)
+    }
 
     private fun getGoogleSignInClient(): GoogleSignInClient {
-        /**
-         * Configure sign-in to request the user's ID, email address, and basic
-         * profile. ID and basic profile are included in DEFAULT_SIGN_IN.
-         */
         val signInOptions = GoogleSignInOptions
             .Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
-            .requestEmail()
-            .requestProfile()
             // Ask for permission to modify everything on user's Drive.
             // TODO: only request scope needed for current task - DRIVE for writing and DRIVE_READONLY for reading
             .requestScopes(Scope(DriveScopes.DRIVE))
             .build()
 
-
-        // Build a GoogleSignInClient with the options specified by our signInOptions object.
         return GoogleSignIn.getClient(requireActivity(), signInOptions);
-    }
-
-    private fun startGoogleSignIn(resultLauncher: ActivityResultLauncher<Intent>) {
-        val signInIntent = getGoogleSignInClient().signInIntent
-        resultLauncher.launch(signInIntent)
     }
 
 
@@ -301,12 +308,8 @@ class DriveFragment : Fragment() {
         val getAccountTask = GoogleSignIn.getSignedInAccountFromIntent(data)
         try {
             val account = getAccountTask.getResult(ApiException::class.java)
-
             // User signed in successfully.
             updateUserGoogleSignInStatus()
-            "account ${account.account}".print()
-            "displayName ${account.displayName}".print()
-            "Email ${account.email}".print()
             "Scopes granted ${account.grantedScopes}".print()
         } catch (e: ApiException) {
             // The ApiException status code indicates the detailed failure reason.
