@@ -80,10 +80,14 @@ dependencies {
         exclude module: 'guava-jdk5'
     }
 
-
     // Google Auth
     implementation 'com.google.android.gms:play-services-auth:19.2.0'
 
+    // CustomActivityOnCrash
+    implementation 'cat.ereza:customactivityoncrash:2.3.0'
+
+    // LeakCanary (for detecting memory leaks)
+    debugImplementation 'com.squareup.leakcanary:leakcanary-android:2.7'
 
     // Not currently used
     testImplementation 'junit:junit:4.13.2'
