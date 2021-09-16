@@ -15,3 +15,9 @@ sealed class State<T> {
  * We use this to build up the directory hierarchy during the backup procedure.
  */
 data class DirectoryInfoContainer(val directoryId: String, val directoryName: String, var directoryUri: Uri?, val parentId: String)
+
+
+enum class OperationType {
+    DOWNLOADING_FOLDERS, DOWNLOADING_FILES, CREATING_DIRECTORIES
+}
+

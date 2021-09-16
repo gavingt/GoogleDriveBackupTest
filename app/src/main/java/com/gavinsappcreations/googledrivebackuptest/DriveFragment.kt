@@ -32,7 +32,6 @@ import com.google.api.client.json.jackson2.JacksonFactory
 import com.google.api.services.drive.Drive
 import com.google.api.services.drive.DriveScopes
 import com.google.api.services.drive.model.File
-import com.google.common.collect.ImmutableSet
 import kotlinx.coroutines.*
 import kotlinx.coroutines.tasks.await
 import java.util.*
@@ -44,12 +43,15 @@ import java.util.*
 
 // TODO: add logs for everything
 // TODO: count overall files downloaded, not just in current batch
-// TODO: merge log in/log out buttons and when logged in display "Log out as gavingt@gmail.com"
-// TODO: add progressBar at top of screen
 
 class DriveFragment : Fragment() {
 
-    //private val directorySet: MutableSet<DirectoryInfoContainer> = mutableSetOf()
+    private val directorySet: MutableSet<DirectoryInfoContainer> = mutableSetOf()
+
+    var iterations = 0
+    var activeRecursiveMethods = 0
+
+    var filesProcessed = 0
 
     var rootDirectoryDocumentFile: DocumentFile? = null
 
@@ -96,11 +98,11 @@ class DriveFragment : Fragment() {
         updateUserGoogleSignInStatus()
 
         binding.logInButton.setOnClickListener {
-            startGoogleSignIn(googleSignInResultLauncher)
-        }
-
-        binding.logOutButton.setOnClickListener {
-            signOut()
+            if (viewModel.viewState.value.isUserSignedIn) {
+                signOut()
+            } else {
+                startGoogleSignIn(googleSignInResultLauncher)
+            }
         }
 
         binding.grantUsbPermissionsButton.setOnClickListener {
@@ -108,21 +110,8 @@ class DriveFragment : Fragment() {
         }
 
         binding.backupButton.setOnClickListener {
-            //copyFilesFromGoogleDriveToLocalDirectory()
-            //fetchDirectoryInfo()
-            //fetchGoogleDriveRootDirectoryId()
             startBackupProcedure()
         }
-
-/*        binding.restoreButton.setOnClickListener{
-            var count = 0
-            for (entry in directorySet) {
-                if (entry.directoryUri == null) {
-                    count++
-                }
-            }
-            count.print()
-        }*/
 
         return binding.root
     }
@@ -133,11 +122,16 @@ class DriveFragment : Fragment() {
 
         // Here we observe and react to changes in our view's state, which is stored in our ViewModel.
         viewModel.viewState.asLiveData().observe(viewLifecycleOwner) { state ->
-            binding.logInButton.isEnabled = !state.isUserSignedIn
-            binding.logOutButton.isEnabled = state.isUserSignedIn
             binding.backupButton.isEnabled = state.isUserSignedIn && state.rootDirectoryUri != null
             // TODO: remove hard-coded "false" before working on restore feature
             binding.restoreButton.isEnabled = false /*state.isUserSignedIn && state.rootDirectoryUri != null*/
+            binding.progressBar.visibility = if (state.isBackupInProgress) View.VISIBLE else View.GONE
+
+            binding.logInButton.text = when (state.isUserSignedIn) {
+                true -> "Logged in as ${state.userEmailAddress}.\n\nLog out?"
+                false -> "Log into Google account"
+            }
+
 
             binding.grantUsbPermissionsButton.text = when (state.rootDirectoryUri) {
                 null -> "Grant USB drive permissions"
@@ -153,6 +147,9 @@ class DriveFragment : Fragment() {
 
 
     private fun startBackupProcedure() {
+
+        viewModel.updateIsBackupInProgress(true)
+
         lifecycleScope.launch(Dispatchers.IO) {
 
             deleteAllFilesInBackupDirectory()
@@ -163,9 +160,12 @@ class DriveFragment : Fragment() {
 
             if (googleDriveRootDirectoryId is Success && directoryInfo is Success) {
                 val backupDirectoryDocumentFile = getOrCreateFolder(rootDirectoryDocumentFile!!, BACKUP_DIRECTORY)
-                createDirectoryStructure(directoryInfo.data, googleDriveRootDirectoryId.data, backupDirectoryDocumentFile)
-/*                delay(60000)
-                copyFilesFromGoogleDriveToLocalDirectory(directoryInfo.data)*/
+                withContext(Dispatchers.Default) {
+                    iterations = 0
+                    directorySet.clear()
+                    directorySet.addAll(directoryInfo.data)
+                    createDirectoryStructure(googleDriveRootDirectoryId.data, backupDirectoryDocumentFile)
+                }
             } else {
                 viewModel.updateUserGoogleSignInStatus(false)
             }
@@ -212,6 +212,7 @@ class DriveFragment : Fragment() {
     private suspend fun fetchDirectoryInfo(): State<MutableSet<DirectoryInfoContainer>> {
 
         val directorySet: MutableSet<DirectoryInfoContainer> = mutableSetOf()
+        filesProcessed = 0
 
         try {
             getDriveService()?.let { googleDriveService ->
@@ -236,7 +237,8 @@ class DriveFragment : Fragment() {
 
                             // Temporarily switch back to main thread to update UI
                             withContext(Dispatchers.Main) {
-                                setBackupButtonText(index + 1, result.files.size, true)
+                                filesProcessed++
+                                setBackupButtonText(OperationType.DOWNLOADING_FOLDERS)
                             }
                         }
                         pageToken = result.nextPageToken
@@ -255,9 +257,12 @@ class DriveFragment : Fragment() {
         }
     }
 
+/*     TODO: for deep directory trees, this method eventually slows way down.
+             This is probably a thread call stack issue and may be solved with this:
+             https://elizarov.medium.com/deep-recursion-with-coroutines-7c53e15993e3 */
+    private suspend fun createDirectoryStructure(directoryBeingBuiltId: String, directoryBeingBuiltDocumentFile: DocumentFile?) {
 
-
-    private fun createDirectoryStructure(directorySet: Set<DirectoryInfoContainer>, directoryBeingBuiltId: String, directoryBeingBuiltDocumentFile: DocumentFile?) {
+        activeRecursiveMethods++
 
         // directoryBeingBuiltId starts as the root directory.
         // Search directorySet to find parent for each entry.
@@ -269,11 +274,30 @@ class DriveFragment : Fragment() {
                 entry.directoryUri = currentSubdirectoryUri
 
                 // Set the subdirectory we just built as directoryBeingBuilt and re-run this method.
-                lifecycleScope.launch(Dispatchers.IO) {
-                    createDirectoryStructure(directorySet, entry.directoryId, currentSubdirectoryDocumentFile)
-                    withContext(Dispatchers.Main) {
-                        "recursive".print()
-                    }
+                lifecycleScope.launch(Dispatchers.Default) {
+                    createDirectoryStructure(entry.directoryId, currentSubdirectoryDocumentFile)
+                }
+            }
+        }
+
+        withContext(Dispatchers.Main) {
+            iterations++
+            "iterations: $iterations".print()
+            "activeRecursiveMethods: $activeRecursiveMethods".print()
+            setBackupButtonText(OperationType.CREATING_DIRECTORIES)
+        }
+
+        activeRecursiveMethods--
+
+        if (activeRecursiveMethods == 0) {
+
+            val incompleteEntry = directorySet.find {
+                it.directoryUri == null
+            }
+
+            if (incompleteEntry == null) {
+                withContext(Dispatchers.IO) {
+                    copyFilesFromGoogleDriveToLocalDirectory(directorySet)
                 }
             }
         }
@@ -281,6 +305,8 @@ class DriveFragment : Fragment() {
 
 
     private fun copyFilesFromGoogleDriveToLocalDirectory(directorySet: MutableSet<DirectoryInfoContainer>) {
+
+        filesProcessed = 0
 
         getDriveService()?.let { googleDriveService ->
 
@@ -290,7 +316,7 @@ class DriveFragment : Fragment() {
                 }
 
                 matchingDirectoryInfoContainer?.let {
-                    // TODO: NPE here
+                    // TODO: NPE here when directory tree is not yet fully created
                     return it.directoryUri!!
                 }
 
@@ -339,12 +365,17 @@ class DriveFragment : Fragment() {
 
                         // Temporarily switch back to main thread to update UI
                         withContext(Dispatchers.Main) {
-                            setBackupButtonText(index + 1, result.files.size, false)
+                            filesProcessed++
+                            setBackupButtonText(OperationType.DOWNLOADING_FILES)
                         }
                     }
                     pageToken = result.nextPageToken
                 } while (pageToken != null)
 
+                viewModel.updateIsBackupInProgress(false)
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(requireActivity(), "Backup complete", Toast.LENGTH_LONG).show()
+                }
             }
         }
     }
@@ -401,7 +432,13 @@ class DriveFragment : Fragment() {
 
 
     private fun updateUserGoogleSignInStatus() {
-        viewModel.updateUserGoogleSignInStatus(GoogleSignIn.getLastSignedInAccount(requireActivity()) != null)
+        val signedInAccount = GoogleSignIn.getLastSignedInAccount(requireActivity())
+
+        viewModel.updateUserGoogleSignInStatus(signedInAccount != null)
+
+        signedInAccount?.let {
+            viewModel.updateUserEmailAddress(signedInAccount.email)
+        }
     }
 
 
@@ -435,8 +472,13 @@ class DriveFragment : Fragment() {
     }
 
 
-    private fun setBackupButtonText(numFilesDownloaded: Int, numFilesTotal: Int, isDownloadingDirectories: Boolean) {
-        val suffix = "\n${if (isDownloadingDirectories) "Directories" else "Files"} downloaded: ${numFilesDownloaded}/${numFilesTotal}"
+    private fun setBackupButtonText(operationType: OperationType) {
+        val suffix = when (operationType) {
+            OperationType.DOWNLOADING_FILES -> "Files downloaded: $filesProcessed"
+            OperationType.DOWNLOADING_FOLDERS -> "Folders downloaded: $filesProcessed"
+            OperationType.CREATING_DIRECTORIES -> "Folders created: $filesProcessed"
+        }
+
         binding.backupButton.text = requireActivity().getString(R.string.backup_button_text, suffix)
     }
 
@@ -460,6 +502,7 @@ class DriveFragment : Fragment() {
     private fun getGoogleSignInClient(): GoogleSignInClient {
         val signInOptions = GoogleSignInOptions
             .Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
+            .requestEmail()
             // Ask for permission to modify everything on user's Drive.
             // TODO: only request scope needed for current task - DRIVE for writing and DRIVE_READONLY for reading
             .requestScopes(Scope(DriveScopes.DRIVE))
@@ -476,6 +519,7 @@ class DriveFragment : Fragment() {
                 signOutTask.await()
                 // Successfully signed out.
                 updateUserGoogleSignInStatus()
+                viewModel.updateUserEmailAddress(null)
                 Toast.makeText(requireActivity(), " Signed out ", Toast.LENGTH_SHORT).show()
             } catch (throwable: Throwable) {
                 Toast.makeText(requireActivity(), " Error ", Toast.LENGTH_SHORT).show()
@@ -489,6 +533,7 @@ class DriveFragment : Fragment() {
         try {
             val account = getAccountTask.getResult(ApiException::class.java)
             // User signed in successfully.
+            viewModel.updateUserEmailAddress(account.email)
             updateUserGoogleSignInStatus()
             "Scopes granted ${account.grantedScopes}".print()
         } catch (e: ApiException) {
