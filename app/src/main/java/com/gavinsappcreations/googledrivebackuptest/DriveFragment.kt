@@ -32,6 +32,7 @@ import com.google.api.client.json.jackson2.JacksonFactory
 import com.google.api.services.drive.Drive
 import com.google.api.services.drive.DriveScopes
 import com.google.api.services.drive.model.File
+import com.google.common.collect.ImmutableSet
 import kotlinx.coroutines.*
 import kotlinx.coroutines.tasks.await
 import java.util.*
@@ -256,13 +257,18 @@ class DriveFragment : Fragment() {
 
 
 
-    private fun createDirectoryStructure(directorySet: MutableSet<DirectoryInfoContainer>, directoryBeingBuiltId: String, directoryBeingBuiltDocumentFile: DocumentFile?) {
+    private fun createDirectoryStructure(directorySet: Set<DirectoryInfoContainer>, directoryBeingBuiltId: String, directoryBeingBuiltDocumentFile: DocumentFile?) {
 
+        // directoryBeingBuiltId starts as the root directory.
+        // Search directorySet to find parent for each entry.
         for (entry in directorySet) {
             if (entry.parentId == directoryBeingBuiltId) {
+                // If we're currently in entry's parent directory, create a subdirectory for entry and fetch its Uri.
                 val currentSubdirectoryDocumentFile = getOrCreateFolder(directoryBeingBuiltDocumentFile!!, entry.directoryName)
                 val currentSubdirectoryUri = currentSubdirectoryDocumentFile!!.uri
                 entry.directoryUri = currentSubdirectoryUri
+
+                // Set the subdirectory we just built as directoryBeingBuilt and re-run this method.
                 lifecycleScope.launch(Dispatchers.IO) {
                     createDirectoryStructure(directorySet, entry.directoryId, currentSubdirectoryDocumentFile)
                     withContext(Dispatchers.Main) {
