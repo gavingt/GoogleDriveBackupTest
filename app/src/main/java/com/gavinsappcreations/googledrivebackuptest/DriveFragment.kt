@@ -32,11 +32,9 @@ import com.google.api.client.json.jackson2.JacksonFactory
 import com.google.api.services.drive.Drive
 import com.google.api.services.drive.DriveScopes
 import com.google.api.services.drive.model.File
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.*
 import kotlinx.coroutines.tasks.await
-import kotlinx.coroutines.withContext
+import java.util.*
 
 // TODO: Use WorkManager to disconnect the backup/restore processes from the UI.
 // TODO: Handle case when user logs out
@@ -49,6 +47,8 @@ import kotlinx.coroutines.withContext
 // TODO: add progressBar at top of screen
 
 class DriveFragment : Fragment() {
+
+    //private val directorySet: MutableSet<DirectoryInfoContainer> = mutableSetOf()
 
     var rootDirectoryDocumentFile: DocumentFile? = null
 
@@ -107,8 +107,21 @@ class DriveFragment : Fragment() {
         }
 
         binding.backupButton.setOnClickListener {
+            //copyFilesFromGoogleDriveToLocalDirectory()
+            //fetchDirectoryInfo()
+            //fetchGoogleDriveRootDirectoryId()
             startBackupProcedure()
         }
+
+/*        binding.restoreButton.setOnClickListener{
+            var count = 0
+            for (entry in directorySet) {
+                if (entry.directoryUri == null) {
+                    count++
+                }
+            }
+            count.print()
+        }*/
 
         return binding.root
     }
@@ -150,12 +163,11 @@ class DriveFragment : Fragment() {
             if (googleDriveRootDirectoryId is Success && directoryInfo is Success) {
                 val backupDirectoryDocumentFile = getOrCreateFolder(rootDirectoryDocumentFile!!, BACKUP_DIRECTORY)
                 createDirectoryStructure(directoryInfo.data, googleDriveRootDirectoryId.data, backupDirectoryDocumentFile)
-                // TODO: uncomment
-                //copyFilesFromGoogleDriveToLocalDirectory(directoryInfo.data)
+/*                delay(60000)
+                copyFilesFromGoogleDriveToLocalDirectory(directoryInfo.data)*/
             } else {
                 viewModel.updateUserGoogleSignInStatus(false)
             }
-
         }
     }
 
@@ -243,51 +255,23 @@ class DriveFragment : Fragment() {
     }
 
 
+
     private fun createDirectoryStructure(directorySet: MutableSet<DirectoryInfoContainer>, directoryBeingBuiltId: String, directoryBeingBuiltDocumentFile: DocumentFile?) {
 
         for (entry in directorySet) {
-            val matchingDirectoryInfoContainer = directorySet.find {
-                it.parentId == directoryBeingBuiltId
-            }
-
-            matchingDirectoryInfoContainer?.let { matchingContainer ->
-                val currentSubdirectoryDocumentFile =
-                    getOrCreateFolder(directoryBeingBuiltDocumentFile!!, matchingContainer.directoryName)
-                val currentSubdirectoryUri = currentSubdirectoryDocumentFile!!.uri
-                matchingContainer.directoryUri = currentSubdirectoryUri
-                createDirectoryStructure(directorySet, matchingContainer.directoryId, currentSubdirectoryDocumentFile)
-            }
-        }
-
-
-
-/*        for (entry in directorySet) {
             if (entry.parentId == directoryBeingBuiltId) {
                 val currentSubdirectoryDocumentFile = getOrCreateFolder(directoryBeingBuiltDocumentFile!!, entry.directoryName)
                 val currentSubdirectoryUri = currentSubdirectoryDocumentFile!!.uri
                 entry.directoryUri = currentSubdirectoryUri
+                lifecycleScope.launch(Dispatchers.IO) {
                     createDirectoryStructure(directorySet, entry.directoryId, currentSubdirectoryDocumentFile)
-            }
-
-            // TODO: this should never happen!
-            if (entry.directoryUri == null) {
-                //("incomplete entry: $entry").print()
-            }
-        }*/
-
-/*        var numEntriesWithNullDirectoryUri = 0
-
-        for (entry in directorySet) {
-            if (entry.directoryUri == null) {
-                numEntriesWithNullDirectoryUri++
+                    withContext(Dispatchers.Main) {
+                        "recursive".print()
+                    }
+                }
             }
         }
-
-        ("numEntriesWithNullDirectoryUri: $numEntriesWithNullDirectoryUri").print()*/
-
-        "g".print()
     }
-
 
 
     private fun copyFilesFromGoogleDriveToLocalDirectory(directorySet: MutableSet<DirectoryInfoContainer>) {
@@ -301,7 +285,6 @@ class DriveFragment : Fragment() {
 
                 matchingDirectoryInfoContainer?.let {
                     // TODO: NPE here
-                    (it).print()
                     return it.directoryUri!!
                 }
 
@@ -384,7 +367,6 @@ class DriveFragment : Fragment() {
     }
 
 
-    // TODO: use this later when we need to construct custom queries for selecting particular files.
     // Constructs a query of the form "'folderA-ID' in parents or 'folderA1-ID' in parents or 'folderA1a-ID' in parents"
 /*    private fun fetchCurrentQuery(): String {
 
@@ -395,7 +377,6 @@ class DriveFragment : Fragment() {
             }
             return directorySelection.plus(" and trashed = false")
     }*/
-
 
 
     /**
@@ -452,7 +433,6 @@ class DriveFragment : Fragment() {
         val suffix = "\n${if (isDownloadingDirectories) "Directories" else "Files"} downloaded: ${numFilesDownloaded}/${numFilesTotal}"
         binding.backupButton.text = requireActivity().getString(R.string.backup_button_text, suffix)
     }
-
 
 
     private fun copyFilesFromLocalDirectoryToGoogleDrive() {
