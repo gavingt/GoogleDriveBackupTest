@@ -14,10 +14,13 @@ sealed class State<T> {
  * Stores directory info that we read from Google Drive.
  * We use this to build up the directory hierarchy during the backup procedure.
  */
-data class DirectoryInfoContainer(val directoryId: String, val directoryName: String, var directoryUri: Uri?, val parentId: String)
+data class DirectoryInfoContainerFull(val directoryId: String, val directoryName: String, var directoryUri: Uri?, val parentId: String)
+
+data class DirectoryInfoContainer(val directoryId: String, val directoryName: String, var directoryUri: Uri?)
+
 
 
 enum class OperationType {
-    DOWNLOADING_FOLDERS, DOWNLOADING_FILES, CREATING_DIRECTORIES
+    FETCHING_ROOT_DIRECTORY_ID, DOWNLOADING_DIRECTORIES, CREATING_DIRECTORIES, DOWNLOADING_FILES, BACKUP_COMPLETE
 }
 

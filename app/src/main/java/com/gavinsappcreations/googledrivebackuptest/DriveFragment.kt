@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.provider.DocumentsContract
 import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
@@ -40,19 +41,31 @@ import java.util.*
 // TODO: Handle case when user logs out
 // TODO: Use this instead for backing up Google Docs files: googleDriveService.files().export()
 // TODO: should we copy files that were "shared with me"?
+// TODO: do we need to worry about a file having multiple parents? Right now we're just using first parent.
+// TODO: Use DocumentsContract.build... methods if I need more specific operations.
 
 // TODO: add logs for everything
-// TODO: count overall files downloaded, not just in current batch
+
+// TODO: download metadata like total # of folders, total # files, total size of Drive before starting backup process.
+
+// TODO: Add cancel option (by pressing backupButton while backup is in progress)
+// TODO: fix method for ending recursive function
+
 
 class DriveFragment : Fragment() {
 
-    private val directorySet: MutableSet<DirectoryInfoContainer> = mutableSetOf()
+    //private val directorySet: MutableSet<DirectoryInfoContainer> = mutableSetOf()
+
+    // Map whose key = parent directory and value = list of subdirectories inside the parent directory.
+    private val directoryMap: MutableMap<String, List<DirectoryInfoContainer>> = mutableMapOf()
 
     var iterations = 0
-    var activeRecursiveMethods = 0
 
     var filesProcessed = 0
 
+    var lastEventTime: Long = 0
+
+    // TODO: get rid of DocumentFile usage
     var rootDirectoryDocumentFile: DocumentFile? = null
 
     private val viewModel by viewModels<DriveViewModel>()
@@ -159,12 +172,14 @@ class DriveFragment : Fragment() {
             val directoryInfo = fetchDirectoryInfo()
 
             if (googleDriveRootDirectoryId is Success && directoryInfo is Success) {
-                val backupDirectoryDocumentFile = getOrCreateFolder(rootDirectoryDocumentFile!!, BACKUP_DIRECTORY)
+                val backupDirectoryUri = getOrCreateDirectory(rootDirectoryDocumentFile!!.uri, BACKUP_DIRECTORY)!!
                 withContext(Dispatchers.Default) {
                     iterations = 0
-                    directorySet.clear()
-                    directorySet.addAll(directoryInfo.data)
-                    createDirectoryStructure(googleDriveRootDirectoryId.data, backupDirectoryDocumentFile)
+                    directoryMap.clear()
+                    directoryMap.putAll(directoryInfo.data)
+                    filesProcessed = 0
+
+                    createDirectoryStructure(googleDriveRootDirectoryId.data, backupDirectoryUri)
                 }
             } else {
                 viewModel.updateUserGoogleSignInStatus(false)
@@ -186,8 +201,14 @@ class DriveFragment : Fragment() {
 
 
     private suspend fun fetchGoogleDriveRootDirectoryId(): State<String> {
+
+        withContext(Dispatchers.Main) {
+            setBackupButtonText(OperationType.FETCHING_ROOT_DIRECTORY_ID)
+        }
+
         try {
             getDriveService()?.let { googleDriveService ->
+                // TODO: wrap in try-catch, especially since IOException can occur from network issues
                 val rootIdResult = lifecycleScope.async(Dispatchers.IO) {
                     val result = googleDriveService.files().get("root").apply {
                         fields = "id"
@@ -209,9 +230,9 @@ class DriveFragment : Fragment() {
     }
 
 
-    private suspend fun fetchDirectoryInfo(): State<MutableSet<DirectoryInfoContainer>> {
+    private suspend fun fetchDirectoryInfo(): State<MutableMap<String, MutableList<DirectoryInfoContainer>>> {
 
-        val directorySet: MutableSet<DirectoryInfoContainer> = mutableSetOf()
+        val directoryMap: MutableMap<String, MutableList<DirectoryInfoContainer>> = mutableMapOf()
         filesProcessed = 0
 
         try {
@@ -219,35 +240,38 @@ class DriveFragment : Fragment() {
                 val directoryInfoResult = lifecycleScope.async(Dispatchers.IO) {
                     var pageToken: String? = null
                     do {
+                        // TODO: wrap in try-catch, especially since IOException can occur from network issues
                         val result = googleDriveService.files().list().apply {
                             spaces = "drive"
-                            pageSize = 1000
+                            pageSize = 1000 // This gets ignored and set to a value of 460 by the API.
                             // Select files that are folders, aren't in trash, and which user owns.
                             q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false and 'me' in owners"
                             fields = "nextPageToken, files(id, name, parents)"
                             this.pageToken = pageToken
                         }.execute()
 
-                        // Iterate through result.files list using an indexed for loop.
-                        for ((index, file) in result.files.withIndex()) {
+                        for (file in result.files) {
                             (file.name).print()
                             (file.parents ?: "null").print()
 
-                            directorySet.add(DirectoryInfoContainer(file.id, file.name, null, file.parents[0]))
+                            val parentUri = file.parents[0]
 
-                            // Temporarily switch back to main thread to update UI
+                            if (directoryMap[parentUri] == null) {
+                                directoryMap[parentUri] = mutableListOf(DirectoryInfoContainer(file.id, file.name, null))
+                            } else {
+                                directoryMap[parentUri]!!.add(DirectoryInfoContainer(file.id, file.name, null))
+                            }
+
+
                             withContext(Dispatchers.Main) {
                                 filesProcessed++
-                                setBackupButtonText(OperationType.DOWNLOADING_FOLDERS)
+                                setBackupButtonText(OperationType.DOWNLOADING_DIRECTORIES)
                             }
                         }
                         pageToken = result.nextPageToken
                     } while (pageToken != null)
 
-                    withContext(Dispatchers.Main) {
-                        (directorySet).print()
-                    }
-                    return@async directorySet
+                    return@async directoryMap
                 }
                 return Success(directoryInfoResult.await())
             }
@@ -257,56 +281,65 @@ class DriveFragment : Fragment() {
         }
     }
 
-/*     TODO: for deep directory trees, this method eventually slows way down.
-             This is probably a thread call stack issue and may be solved with this:
-             https://elizarov.medium.com/deep-recursion-with-coroutines-7c53e15993e3 */
-    private suspend fun createDirectoryStructure(directoryBeingBuiltId: String, directoryBeingBuiltDocumentFile: DocumentFile?) {
 
-        activeRecursiveMethods++
+    // TODO: what if I make reference to coroutineJob and cancel it at end?
+    // TODO: can I exploit structured concurrency to wait for all recursive functions to end?
+    // TODO: filesProcessed number is now reported incorrectly by this method.
+    private suspend fun createDirectoryStructure(directoryBeingBuiltId: String, directoryBeingBuiltUri: Uri) {
 
-        // directoryBeingBuiltId starts as the root directory.
-        // Search directorySet to find parent for each entry.
-        for (entry in directorySet) {
-            if (entry.parentId == directoryBeingBuiltId) {
-                // If we're currently in entry's parent directory, create a subdirectory for entry and fetch its Uri.
-                val currentSubdirectoryDocumentFile = getOrCreateFolder(directoryBeingBuiltDocumentFile!!, entry.directoryName)
-                val currentSubdirectoryUri = currentSubdirectoryDocumentFile!!.uri
-                entry.directoryUri = currentSubdirectoryUri
+        lastEventTime = System.currentTimeMillis()
 
-                // Set the subdirectory we just built as directoryBeingBuilt and re-run this method.
-                lifecycleScope.launch(Dispatchers.Default) {
-                    createDirectoryStructure(entry.directoryId, currentSubdirectoryDocumentFile)
-                }
-            }
+        // Create subdirectories for all children of directoryBeingBuilt.
+        directoryMap[directoryBeingBuiltId]?.forEach { childDirectory ->
+
+            // Create a directory for each childDirectory and fetch its Uri.
+            val currentSubdirectoryUri = getOrCreateDirectory(directoryBeingBuiltUri, childDirectory.directoryName)!!
+
+            childDirectory.directoryUri = currentSubdirectoryUri
+
+            // Set the subdirectory we just built as directoryBeingBuilt and re-run this method.
+            //lifecycleScope.launch(Dispatchers.Default) {
+                createDirectoryStructure(childDirectory.directoryId, currentSubdirectoryUri)
+                filesProcessed++
+           // }
         }
 
         withContext(Dispatchers.Main) {
             iterations++
             "iterations: $iterations".print()
-            "activeRecursiveMethods: $activeRecursiveMethods".print()
             setBackupButtonText(OperationType.CREATING_DIRECTORIES)
         }
 
-        activeRecursiveMethods--
 
-        if (activeRecursiveMethods == 0) {
+        // TODO: find better way to detect end of recursive operation.
 
-            val incompleteEntry = directorySet.find {
-                it.directoryUri == null
+        val nullUrisRemain = directoryMap.any { map ->
+            map.value.any { list ->
+                list.directoryUri == null
             }
+        }
 
-            if (incompleteEntry == null) {
-                withContext(Dispatchers.IO) {
-                    copyFilesFromGoogleDriveToLocalDirectory(directorySet)
-                }
+        if (!nullUrisRemain) {
+            withContext(Dispatchers.IO) {
+                copyFilesFromGoogleDriveToLocalDirectory(directoryMap)
             }
         }
     }
 
 
-    private fun copyFilesFromGoogleDriveToLocalDirectory(directorySet: MutableSet<DirectoryInfoContainer>) {
+    private fun copyFilesFromGoogleDriveToLocalDirectory(directoryMap: MutableMap<String, List<DirectoryInfoContainer>>) {
 
         filesProcessed = 0
+
+        val directorySet = mutableSetOf<DirectoryInfoContainerFull>()
+
+        directoryMap.forEach {
+            for (entry in it.value) {
+                directorySet.add(DirectoryInfoContainerFull(entry.directoryId, entry.directoryName, entry.directoryUri, it.key))
+            }
+        }
+
+
 
         getDriveService()?.let { googleDriveService ->
 
@@ -316,7 +349,6 @@ class DriveFragment : Fragment() {
                 }
 
                 matchingDirectoryInfoContainer?.let {
-                    // TODO: NPE here when directory tree is not yet fully created
                     return it.directoryUri!!
                 }
 
@@ -327,12 +359,16 @@ class DriveFragment : Fragment() {
 
             fun createLocalFileFromGoogleDriveFile(file: File) {
                 val parentId = file.parents[0]
-                val parentUri = fetchParentUriFromParentId(parentId)!!
 
+                // TODO: NPE here now.
+                val parentUri = fetchParentUriFromParentId(parentId) ?: rootDirectoryDocumentFile!!.uri
+
+                // TODO: get rid of DocumentFile
                 val parentDocumentFile = DocumentFile.fromTreeUri(requireActivity(), parentUri)
                 val localDocumentFile = parentDocumentFile!!.createFile(file.mimeType, file.name)
 
                 localDocumentFile?.let {
+                    // TODO: wrap in try-catch, especially since IOException can occur from network issues
                     val outputStream = requireActivity().contentResolver.openOutputStream(localDocumentFile.uri)!!
                     googleDriveService.files().get(file.id).executeMediaAndDownloadTo(outputStream)
                     outputStream.close()
@@ -350,8 +386,7 @@ class DriveFragment : Fragment() {
                         this.pageToken = pageToken
                     }.execute()
 
-                    // Iterate through result.files list using an indexed for loop.
-                    for ((index, file) in result.files.withIndex()) {
+                    for (file in result.files) {
                         (file.name).print()
                         (file.mimeType).print()
                         (file.parents ?: "null").print()
@@ -375,6 +410,7 @@ class DriveFragment : Fragment() {
                 viewModel.updateIsBackupInProgress(false)
                 withContext(Dispatchers.Main) {
                     Toast.makeText(requireActivity(), "Backup complete", Toast.LENGTH_LONG).show()
+                    setBackupButtonText(OperationType.BACKUP_COMPLETE)
                 }
             }
         }
@@ -467,16 +503,20 @@ class DriveFragment : Fragment() {
     }
 
 
-    private fun getOrCreateFolder(parent: DocumentFile, name: String): DocumentFile? {
-        return parent.findFile(name) ?: parent.createDirectory(name)
+    private fun getOrCreateDirectory(parentUri: Uri, name: String): Uri? {
+        return DocumentsContract.createDocument(
+            requireActivity().contentResolver, parentUri, DocumentsContract.Document.MIME_TYPE_DIR, name)
+
     }
 
 
     private fun setBackupButtonText(operationType: OperationType) {
         val suffix = when (operationType) {
+            OperationType.FETCHING_ROOT_DIRECTORY_ID -> "Fetching root directory id..."
+            OperationType.DOWNLOADING_DIRECTORIES -> "Directories downloaded: $filesProcessed"
+            OperationType.CREATING_DIRECTORIES -> "Directories created: $filesProcessed"
             OperationType.DOWNLOADING_FILES -> "Files downloaded: $filesProcessed"
-            OperationType.DOWNLOADING_FOLDERS -> "Folders downloaded: $filesProcessed"
-            OperationType.CREATING_DIRECTORIES -> "Folders created: $filesProcessed"
+            OperationType.BACKUP_COMPLETE -> "Backup complete"
         }
 
         binding.backupButton.text = requireActivity().getString(R.string.backup_button_text, suffix)
