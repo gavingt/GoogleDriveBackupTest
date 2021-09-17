@@ -44,17 +44,13 @@ import java.util.*
 // TODO: do we need to worry about a file having multiple parents? Right now we're just using first parent.
 // TODO: Use DocumentsContract.build... methods if I need more specific operations.
 
-// TODO: add logs for everything
-
 // TODO: download metadata like total # of folders, total # files, total size of Drive before starting backup process.
-
 // TODO: Add cancel option (by pressing backupButton while backup is in progress)
 // TODO: fix method for ending recursive function
 
 
 class DriveFragment : Fragment() {
 
-    //private val directorySet: MutableSet<DirectoryInfoContainer> = mutableSetOf()
 
     // Map whose key = parent directory and value = list of subdirectories inside the parent directory.
     private val directoryMap: MutableMap<String, List<DirectoryInfoContainer>> = mutableMapOf()
@@ -67,6 +63,9 @@ class DriveFragment : Fragment() {
 
     // TODO: get rid of DocumentFile usage
     var rootDirectoryDocumentFile: DocumentFile? = null
+
+    private var createDirectoryJob: Job = Job()
+    private var jobSet = mutableSetOf<Job>()
 
     private val viewModel by viewModels<DriveViewModel>()
     private lateinit var binding: FragmentDriveBinding
@@ -173,14 +172,29 @@ class DriveFragment : Fragment() {
 
             if (googleDriveRootDirectoryId is Success && directoryInfo is Success) {
                 val backupDirectoryUri = getOrCreateDirectory(rootDirectoryDocumentFile!!.uri, BACKUP_DIRECTORY)!!
-                withContext(Dispatchers.Default) {
-                    iterations = 0
-                    directoryMap.clear()
-                    directoryMap.putAll(directoryInfo.data)
-                    filesProcessed = 0
+                iterations = 0
+                directoryMap.clear()
+                directoryMap.putAll(directoryInfo.data)
+                filesProcessed = 0
 
+                withContext(Dispatchers.Default) {
                     createDirectoryStructure(googleDriveRootDirectoryId.data, backupDirectoryUri)
+                    copyFilesFromGoogleDriveToLocalDirectory(directoryMap)
                 }
+
+
+/*                for (job in jobSet) {
+                    job.invokeOnCompletion {
+                        val allJobsAreCompleted = jobSet.all {
+                            it.isCompleted
+                        }
+
+                        if (allJobsAreCompleted) {
+                            copyFilesFromGoogleDriveToLocalDirectory(directoryMap)
+                        }
+                    }
+                }*/
+
             } else {
                 viewModel.updateUserGoogleSignInStatus(false)
             }
@@ -193,7 +207,9 @@ class DriveFragment : Fragment() {
      * only deletes files in the "backup_directory" folder we create, so it won't delete your personal files
      */
     private fun deleteAllFilesInBackupDirectory() {
-        val listOfBackupDirectoryFiles = rootDirectoryDocumentFile!!.listFiles()
+        setBackupButtonText(OperationType.DELETING_OLD_FILES)
+        // TODO: get rid of DocumentFile usage
+        val listOfBackupDirectoryFiles: Array<DocumentFile> = rootDirectoryDocumentFile!!.listFiles()
         for (file in listOfBackupDirectoryFiles) {
             file.delete()
         }
@@ -262,7 +278,6 @@ class DriveFragment : Fragment() {
                                 directoryMap[parentUri]!!.add(DirectoryInfoContainer(file.id, file.name, null))
                             }
 
-
                             withContext(Dispatchers.Main) {
                                 filesProcessed++
                                 setBackupButtonText(OperationType.DOWNLOADING_DIRECTORIES)
@@ -281,12 +296,11 @@ class DriveFragment : Fragment() {
         }
     }
 
-
-    // TODO: what if I make reference to coroutineJob and cancel it at end?
-    // TODO: can I exploit structured concurrency to wait for all recursive functions to end?
+    // TODO: fix the threadpool:  https://stackoverflow.com/questions/53916377/how-to-join-a-kotlin-supervisorjob
+    // TODO: try setting createDirectoryJob equal to the recursive coroutine and add a listener to check when createDirectoryJob.isActive == false
+    //       (or try invokeOnCompletion again)
     // TODO: filesProcessed number is now reported incorrectly by this method.
     private suspend fun createDirectoryStructure(directoryBeingBuiltId: String, directoryBeingBuiltUri: Uri) {
-
         lastEventTime = System.currentTimeMillis()
 
         // Create subdirectories for all children of directoryBeingBuilt.
@@ -294,14 +308,14 @@ class DriveFragment : Fragment() {
 
             // Create a directory for each childDirectory and fetch its Uri.
             val currentSubdirectoryUri = getOrCreateDirectory(directoryBeingBuiltUri, childDirectory.directoryName)!!
-
             childDirectory.directoryUri = currentSubdirectoryUri
 
             // Set the subdirectory we just built as directoryBeingBuilt and re-run this method.
-            //lifecycleScope.launch(Dispatchers.Default) {
+            //val childJob = lifecycleScope.launch(Dispatchers.Default) {
                 createDirectoryStructure(childDirectory.directoryId, currentSubdirectoryUri)
                 filesProcessed++
-           // }
+            //}
+            //jobSet.add(childJob)
         }
 
         withContext(Dispatchers.Main) {
@@ -310,20 +324,6 @@ class DriveFragment : Fragment() {
             setBackupButtonText(OperationType.CREATING_DIRECTORIES)
         }
 
-
-        // TODO: find better way to detect end of recursive operation.
-
-        val nullUrisRemain = directoryMap.any { map ->
-            map.value.any { list ->
-                list.directoryUri == null
-            }
-        }
-
-        if (!nullUrisRemain) {
-            withContext(Dispatchers.IO) {
-                copyFilesFromGoogleDriveToLocalDirectory(directoryMap)
-            }
-        }
     }
 
 
@@ -338,8 +338,6 @@ class DriveFragment : Fragment() {
                 directorySet.add(DirectoryInfoContainerFull(entry.directoryId, entry.directoryName, entry.directoryUri, it.key))
             }
         }
-
-
 
         getDriveService()?.let { googleDriveService ->
 
@@ -360,7 +358,6 @@ class DriveFragment : Fragment() {
             fun createLocalFileFromGoogleDriveFile(file: File) {
                 val parentId = file.parents[0]
 
-                // TODO: NPE here now.
                 val parentUri = fetchParentUriFromParentId(parentId) ?: rootDirectoryDocumentFile!!.uri
 
                 // TODO: get rid of DocumentFile
@@ -505,18 +502,20 @@ class DriveFragment : Fragment() {
 
     private fun getOrCreateDirectory(parentUri: Uri, name: String): Uri? {
         return DocumentsContract.createDocument(
-            requireActivity().contentResolver, parentUri, DocumentsContract.Document.MIME_TYPE_DIR, name)
+            requireActivity().contentResolver, parentUri, DocumentsContract.Document.MIME_TYPE_DIR, name
+        )
 
     }
 
 
     private fun setBackupButtonText(operationType: OperationType) {
         val suffix = when (operationType) {
+            OperationType.DELETING_OLD_FILES -> "Deleting old backup files..."
             OperationType.FETCHING_ROOT_DIRECTORY_ID -> "Fetching root directory id..."
             OperationType.DOWNLOADING_DIRECTORIES -> "Directories downloaded: $filesProcessed"
             OperationType.CREATING_DIRECTORIES -> "Directories created: $filesProcessed"
             OperationType.DOWNLOADING_FILES -> "Files downloaded: $filesProcessed"
-            OperationType.BACKUP_COMPLETE -> "Backup complete"
+            OperationType.BACKUP_COMPLETE -> "Backup complete!"
         }
 
         binding.backupButton.text = requireActivity().getString(R.string.backup_button_text, suffix)
@@ -592,7 +591,6 @@ class DriveFragment : Fragment() {
         private const val BACKUP_DIRECTORY = "backup_directory"
 
         private const val DRIVE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
-        private const val GOOGLE_DOC_FILE_MIME_TYPE = "application/vnd.google-apps.document"
         private const val GOOGLE_APP_FILE_MIME_TYPE_PREFIX = "application/vnd.google-apps"
         private const val UNKNOWN_FILE_MIME_TYPE = "application/octet-stream"
     }
