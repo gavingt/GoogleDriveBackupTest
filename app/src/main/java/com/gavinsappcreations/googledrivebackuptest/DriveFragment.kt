@@ -37,6 +37,27 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.tasks.await
 import java.util.*
 
+/**
+ * In the app we’re building, we will need to show a ‘Searching…’ screen which counts the number of files
+ * found in user’s Google Drive, when we count files, we will need to categorize files into
+ * photo/video/audio/document/others. When search is complete, the app will switch to ‘Backing up…’ screen
+ * with a progress like ‘10 of 104 has been copied’ and will download files one by one.
+ *
+ * To make it easier to integrate your code into the existing app, I have these suggestions for your reference:
+ *
+ * We will need to count the number of files before downloading any of them.
+ *
+ * We can’t create all subfolders at a time, we will have to create folders as needed. For example
+ * if there are 400 folders created, but the app crashed while download the 1st file, then we left
+ * 400 empty folders on the drive which is not good. Also, it takes time to create 400 folders,
+ * and will not be a good user experience.
+ *
+ * Optionally, is it possible to enumerate through Google Drive only once?
+ * I see we are enumerating all folders, and then later enumerating all non-folder files.
+ * If we can enumerate all objects during ‘Searching…’, count file objects and also build folder structure, then would be great.
+ */
+
+
 // TODO: Use WorkManager to disconnect the backup/restore processes from the UI.
 // TODO: Handle case when user logs out
 // TODO: Use this instead for backing up Google Docs files: googleDriveService.files().export()
@@ -59,13 +80,8 @@ class DriveFragment : Fragment() {
 
     var filesProcessed = 0
 
-    var lastEventTime: Long = 0
-
     // TODO: get rid of DocumentFile usage
     var rootDirectoryDocumentFile: DocumentFile? = null
-
-    private var createDirectoryJob: Job = Job()
-    private var jobSet = mutableSetOf<Job>()
 
     private val viewModel by viewModels<DriveViewModel>()
     private lateinit var binding: FragmentDriveBinding
@@ -172,6 +188,7 @@ class DriveFragment : Fragment() {
 
             if (googleDriveRootDirectoryId is Success && directoryInfo is Success) {
                 val backupDirectoryUri = getOrCreateDirectory(rootDirectoryDocumentFile!!.uri, BACKUP_DIRECTORY)!!
+
                 iterations = 0
                 directoryMap.clear()
                 directoryMap.putAll(directoryInfo.data)
@@ -179,21 +196,10 @@ class DriveFragment : Fragment() {
 
                 withContext(Dispatchers.Default) {
                     createDirectoryStructure(googleDriveRootDirectoryId.data, backupDirectoryUri)
-                    copyFilesFromGoogleDriveToLocalDirectory(directoryMap)
                 }
 
+                copyFilesFromGoogleDriveToLocalDirectory(directoryMap)
 
-/*                for (job in jobSet) {
-                    job.invokeOnCompletion {
-                        val allJobsAreCompleted = jobSet.all {
-                            it.isCompleted
-                        }
-
-                        if (allJobsAreCompleted) {
-                            copyFilesFromGoogleDriveToLocalDirectory(directoryMap)
-                        }
-                    }
-                }*/
 
             } else {
                 viewModel.updateUserGoogleSignInStatus(false)
@@ -206,8 +212,10 @@ class DriveFragment : Fragment() {
      * For testing purposes, delete all current files in backup directory before starting. This
      * only deletes files in the "backup_directory" folder we create, so it won't delete your personal files
      */
-    private fun deleteAllFilesInBackupDirectory() {
-        setBackupButtonText(OperationType.DELETING_OLD_FILES)
+    private suspend fun deleteAllFilesInBackupDirectory() {
+        withContext(Dispatchers.Main) {
+            setBackupButtonText(OperationType.DELETING_OLD_FILES)
+        }
         // TODO: get rid of DocumentFile usage
         val listOfBackupDirectoryFiles: Array<DocumentFile> = rootDirectoryDocumentFile!!.listFiles()
         for (file in listOfBackupDirectoryFiles) {
@@ -296,34 +304,37 @@ class DriveFragment : Fragment() {
         }
     }
 
-    // TODO: fix the threadpool:  https://stackoverflow.com/questions/53916377/how-to-join-a-kotlin-supervisorjob
-    // TODO: try setting createDirectoryJob equal to the recursive coroutine and add a listener to check when createDirectoryJob.isActive == false
-    //       (or try invokeOnCompletion again)
-    // TODO: filesProcessed number is now reported incorrectly by this method.
+// TODO: edit post to include getOrCreateDirectory method
+
+
+    // TODO: can I create the directory on demand as I'm creating the file?
+// TODO: only use coroutines for getOrCreateDirectory method (IO dispatcher), not for anything else?
+// TODO: fix the threadpool:  https://stackoverflow.com/questions/53916377/how-to-join-a-kotlin-supervisorjob
+// TODO: try setting createDirectoryJob equal to the recursive coroutine and add a listener to check when createDirectoryJob.isActive == false
+//       (or try invokeOnCompletion again)
+// TODO: filesProcessed number is now reported incorrectly by this method.
     private suspend fun createDirectoryStructure(directoryBeingBuiltId: String, directoryBeingBuiltUri: Uri) {
-        lastEventTime = System.currentTimeMillis()
+        coroutineScope {
+            // Create subdirectories for all children of directoryBeingBuilt.
+            directoryMap[directoryBeingBuiltId]?.forEach { childDirectory ->
 
-        // Create subdirectories for all children of directoryBeingBuilt.
-        directoryMap[directoryBeingBuiltId]?.forEach { childDirectory ->
+                // Create a directory for each childDirectory and set its Uri in directoryMap.
+                val currentSubdirectoryUri = getOrCreateDirectory(directoryBeingBuiltUri, childDirectory.directoryName)!!
+                childDirectory.directoryUri = currentSubdirectoryUri
 
-            // Create a directory for each childDirectory and fetch its Uri.
-            val currentSubdirectoryUri = getOrCreateDirectory(directoryBeingBuiltUri, childDirectory.directoryName)!!
-            childDirectory.directoryUri = currentSubdirectoryUri
+                // Set the subdirectory we just built as directoryBeingBuilt and re-run this method.
+                launch {
+                    createDirectoryStructure(childDirectory.directoryId, currentSubdirectoryUri)
+                    filesProcessed++
+                }
+            }
 
-            // Set the subdirectory we just built as directoryBeingBuilt and re-run this method.
-            //val childJob = lifecycleScope.launch(Dispatchers.Default) {
-                createDirectoryStructure(childDirectory.directoryId, currentSubdirectoryUri)
-                filesProcessed++
-            //}
-            //jobSet.add(childJob)
+            withContext(Dispatchers.Main) {
+                iterations++
+                "iterations: $iterations".print()
+                setBackupButtonText(OperationType.CREATING_DIRECTORIES)
+            }
         }
-
-        withContext(Dispatchers.Main) {
-            iterations++
-            "iterations: $iterations".print()
-            setBackupButtonText(OperationType.CREATING_DIRECTORIES)
-        }
-
     }
 
 
@@ -437,7 +448,7 @@ class DriveFragment : Fragment() {
     }
 
 
-    // Constructs a query of the form "'folderA-ID' in parents or 'folderA1-ID' in parents or 'folderA1a-ID' in parents"
+// Constructs a query of the form "'folderA-ID' in parents or 'folderA1-ID' in parents or 'folderA1a-ID' in parents"
 /*    private fun fetchCurrentQuery(): String {
 
             var directorySelection = ROOT_DIRECTORY
@@ -504,7 +515,6 @@ class DriveFragment : Fragment() {
         return DocumentsContract.createDocument(
             requireActivity().contentResolver, parentUri, DocumentsContract.Document.MIME_TYPE_DIR, name
         )
-
     }
 
 
