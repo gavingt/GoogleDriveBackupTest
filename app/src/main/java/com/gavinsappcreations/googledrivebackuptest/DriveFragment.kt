@@ -43,8 +43,6 @@ import java.util.*
  * photo/video/audio/document/others. When search is complete, the app will switch to ‘Backing up…’ screen
  * with a progress like ‘10 of 104 has been copied’ and will download files one by one.
  *
- * To make it easier to integrate your code into the existing app, I have these suggestions for your reference:
- *
  * We will need to count the number of files before downloading any of them.
  *
  * We can’t create all subfolders at a time, we will have to create folders as needed. For example
@@ -58,16 +56,22 @@ import java.util.*
  */
 
 
-// TODO: Use WorkManager to disconnect the backup/restore processes from the UI.
-// TODO: Handle case when user logs out
-// TODO: Use this instead for backing up Google Docs files: googleDriveService.files().export()
-// TODO: should we copy files that were "shared with me"?
-// TODO: do we need to worry about a file having multiple parents? Right now we're just using first parent.
+
+// TODO: Handle case when user logs out.
+// TODO: Should we copy files that were "shared with me"?
+// TODO: Do we need to worry about a file having multiple parents? Right now we're just using first parent.
 // TODO: Use DocumentsContract.build... methods if I need more specific operations.
 
-// TODO: download metadata like total # of folders, total # files, total size of Drive before starting backup process.
-// TODO: Add cancel option (by pressing backupButton while backup is in progress)
-// TODO: fix method for ending recursive function
+// TODO: Before restoring, check the user's free space on Google Drive: https://developers.google.com/drive/api/v3/reference/about/
+//       Also check each file being uploaded against the user's max upload size (see link for that as well)
+// TODO: Can I create the directory on demand as I'm creating the file?
+// TODO: Download metadata like total # of folders, total # files, total size of Drive,
+//       and total number of each filetype (photo/video/audio/document/others) before starting backup process.
+//       Do this all at once instead of splitting it up into folders and then files (what about finding the root as part of this?).
+// TODO: Add cancel option (by pressing backupButton while backup is in progress).
+// TODO: Use WorkManager to disconnect the backup/restore processes from the UI.
+// TODO: Use this instead for backing up Google Docs files: googleDriveService.files().export()
+// TODO: make repo private (make private and then go to "Manage access" in left pane of Settings screen to invite people.
 
 
 class DriveFragment : Fragment() {
@@ -304,15 +308,10 @@ class DriveFragment : Fragment() {
         }
     }
 
-// TODO: edit post to include getOrCreateDirectory method
 
 
-    // TODO: can I create the directory on demand as I'm creating the file?
-// TODO: only use coroutines for getOrCreateDirectory method (IO dispatcher), not for anything else?
-// TODO: fix the threadpool:  https://stackoverflow.com/questions/53916377/how-to-join-a-kotlin-supervisorjob
-// TODO: try setting createDirectoryJob equal to the recursive coroutine and add a listener to check when createDirectoryJob.isActive == false
-//       (or try invokeOnCompletion again)
-// TODO: filesProcessed number is now reported incorrectly by this method.
+
+    // TODO: filesProcessed number is now reported incorrectly by this method?
     private suspend fun createDirectoryStructure(directoryBeingBuiltId: String, directoryBeingBuiltUri: Uri) {
         coroutineScope {
             // Create subdirectories for all children of directoryBeingBuilt.
@@ -511,8 +510,8 @@ class DriveFragment : Fragment() {
     }
 
 
-    private fun getOrCreateDirectory(parentUri: Uri, name: String): Uri? {
-        return DocumentsContract.createDocument(
+    private suspend fun getOrCreateDirectory(parentUri: Uri, name: String): Uri? = withContext(Dispatchers.IO) {
+        DocumentsContract.createDocument(
             requireActivity().contentResolver, parentUri, DocumentsContract.Document.MIME_TYPE_DIR, name
         )
     }
