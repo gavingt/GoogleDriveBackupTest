@@ -11,15 +11,32 @@ sealed class State<T> {
 
 
 /**
- * Stores directory info that we read from Google Drive.
+ * Stores subdirectory info that we read from Google Drive.
  * We use this to build up the directory hierarchy during the backup procedure.
+ * This class is suitable for use with a Map that's keyed to the subdirectory's parentDirectoryId.
  */
-data class DirectoryInfoContainerFull(val directoryId: String, val directoryName: String, var directoryUri: Uri?, val parentId: String)
+data class SubdirectoryContainer(
+    val subdirectoryId: String,
+    val subdirectoryName: String,
+    var subdirectoryUri: Uri?
+)
 
-data class DirectoryInfoContainer(val directoryId: String, val directoryName: String, var directoryUri: Uri?)
+
+/**
+ * Same as SubdirectoryContainer, except also include parentDirectoryId.
+ * This class is suitable for use with a Set.
+ */
+data class SubdirectoryContainerWithParent(
+    val directoryId: String,
+    val directoryName: String,
+    var directoryUri: Uri?,
+    val parentDirectoryId: String
+)
 
 
-
+/**
+ * Indicates the current operation that's being performed.
+ */
 enum class OperationType {
     DELETING_OLD_FILES,
     FETCHING_ROOT_DIRECTORY_ID,

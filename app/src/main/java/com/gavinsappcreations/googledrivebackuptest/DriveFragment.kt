@@ -56,29 +56,30 @@ import java.util.*
  */
 
 
-
 // TODO: Handle case when user logs out.
 // TODO: Should we copy files that were "shared with me"?
 // TODO: Do we need to worry about a file having multiple parents? Right now we're just using first parent.
 // TODO: Use DocumentsContract.build... methods if I need more specific operations.
+// TODO: how do I handle changes to Google Drive files mid-backup?: https://developers.google.com/drive/api/v3/reference/changes
 
 // TODO: Before restoring, check the user's free space on Google Drive: https://developers.google.com/drive/api/v3/reference/about/
 //       Also check each file being uploaded against the user's max upload size (see link for that as well)
 // TODO: Can I create the directory on demand as I'm creating the file?
 // TODO: Download metadata like total # of folders, total # files, total size of Drive,
 //       and total number of each filetype (photo/video/audio/document/others) before starting backup process.
-//       Do this all at once instead of splitting it up into folders and then files (what about finding the root as part of this?).
+//       Do this all at once instead of splitting it up into folders and then files.
 // TODO: Add cancel option (by pressing backupButton while backup is in progress).
-// TODO: Use WorkManager to disconnect the backup/restore processes from the UI.
-// TODO: Use this instead for backing up Google Docs files: googleDriveService.files().export()
+// TODO: Use WorkManager in ForegroundService mode to disconnect the backup/restore processes from the UI:
+//       https://www.raywenderlich.com/20689637-scheduling-tasks-with-android-workmanager
 // TODO: make repo private (make private and then go to "Manage access" in left pane of Settings screen to invite people.
 
 
 class DriveFragment : Fragment() {
 
 
-    // Map whose key = parent directory and value = list of subdirectories inside the parent directory.
-    private val directoryMap: MutableMap<String, List<DirectoryInfoContainer>> = mutableMapOf()
+    // Map of directories whose key = parent directory id and value = list of child directories inside the parent directory.
+    // If a directory doesn't have any child directories, it won't be listed as a key.
+    private val directoryMap: MutableMap<String, List<SubdirectoryContainer>> = mutableMapOf()
 
     var iterations = 0
 
@@ -155,8 +156,7 @@ class DriveFragment : Fragment() {
         // Here we observe and react to changes in our view's state, which is stored in our ViewModel.
         viewModel.viewState.asLiveData().observe(viewLifecycleOwner) { state ->
             binding.backupButton.isEnabled = state.isUserSignedIn && state.rootDirectoryUri != null
-            // TODO: remove hard-coded "false" before working on restore feature
-            binding.restoreButton.isEnabled = false /*state.isUserSignedIn && state.rootDirectoryUri != null*/
+            binding.restoreButton.isEnabled = state.isUserSignedIn && state.rootDirectoryUri != null
             binding.progressBar.visibility = if (state.isBackupInProgress) View.VISIBLE else View.GONE
 
             binding.logInButton.text = when (state.isUserSignedIn) {
@@ -198,9 +198,7 @@ class DriveFragment : Fragment() {
                 directoryMap.putAll(directoryInfo.data)
                 filesProcessed = 0
 
-                withContext(Dispatchers.Default) {
-                    createDirectoryStructure(googleDriveRootDirectoryId.data, backupDirectoryUri)
-                }
+                createDirectoryStructure(googleDriveRootDirectoryId.data, backupDirectoryUri)
 
                 copyFilesFromGoogleDriveToLocalDirectory(directoryMap)
 
@@ -227,6 +225,8 @@ class DriveFragment : Fragment() {
         }
     }
 
+    // TODO: rather than a network request, in this method we should search directoryMap for the one
+    //       directory that doesn't have a parent directory (that's the root)
 
     private suspend fun fetchGoogleDriveRootDirectoryId(): State<String> {
 
@@ -236,7 +236,7 @@ class DriveFragment : Fragment() {
 
         try {
             getDriveService()?.let { googleDriveService ->
-                // TODO: wrap in try-catch, especially since IOException can occur from network issues
+                // TODO: wrap in try-catch, since IOException can occur from network issues
                 val rootIdResult = lifecycleScope.async(Dispatchers.IO) {
                     val result = googleDriveService.files().get("root").apply {
                         fields = "id"
@@ -258,9 +258,9 @@ class DriveFragment : Fragment() {
     }
 
 
-    private suspend fun fetchDirectoryInfo(): State<MutableMap<String, MutableList<DirectoryInfoContainer>>> {
+    private suspend fun fetchDirectoryInfo(): State<MutableMap<String, MutableList<SubdirectoryContainer>>> {
 
-        val directoryMap: MutableMap<String, MutableList<DirectoryInfoContainer>> = mutableMapOf()
+        val directoryMap: MutableMap<String, MutableList<SubdirectoryContainer>> = mutableMapOf()
         filesProcessed = 0
 
         try {
@@ -268,7 +268,7 @@ class DriveFragment : Fragment() {
                 val directoryInfoResult = lifecycleScope.async(Dispatchers.IO) {
                     var pageToken: String? = null
                     do {
-                        // TODO: wrap in try-catch, especially since IOException can occur from network issues
+                        // TODO: wrap in try-catch, since IOException can occur from network issues
                         val result = googleDriveService.files().list().apply {
                             spaces = "drive"
                             pageSize = 1000 // This gets ignored and set to a value of 460 by the API.
@@ -285,9 +285,9 @@ class DriveFragment : Fragment() {
                             val parentUri = file.parents[0]
 
                             if (directoryMap[parentUri] == null) {
-                                directoryMap[parentUri] = mutableListOf(DirectoryInfoContainer(file.id, file.name, null))
+                                directoryMap[parentUri] = mutableListOf(SubdirectoryContainer(file.id, file.name, null))
                             } else {
-                                directoryMap[parentUri]!!.add(DirectoryInfoContainer(file.id, file.name, null))
+                                directoryMap[parentUri]!!.add(SubdirectoryContainer(file.id, file.name, null))
                             }
 
                             withContext(Dispatchers.Main) {
@@ -310,20 +310,18 @@ class DriveFragment : Fragment() {
 
 
 
-
-    // TODO: filesProcessed number is now reported incorrectly by this method?
     private suspend fun createDirectoryStructure(directoryBeingBuiltId: String, directoryBeingBuiltUri: Uri) {
         coroutineScope {
             // Create subdirectories for all children of directoryBeingBuilt.
             directoryMap[directoryBeingBuiltId]?.forEach { childDirectory ->
 
                 // Create a directory for each childDirectory and set its Uri in directoryMap.
-                val currentSubdirectoryUri = getOrCreateDirectory(directoryBeingBuiltUri, childDirectory.directoryName)!!
-                childDirectory.directoryUri = currentSubdirectoryUri
+                val currentSubdirectoryUri = getOrCreateDirectory(directoryBeingBuiltUri, childDirectory.subdirectoryName)!!
+                childDirectory.subdirectoryUri = currentSubdirectoryUri
 
                 // Set the subdirectory we just built as directoryBeingBuilt and re-run this method.
                 launch {
-                    createDirectoryStructure(childDirectory.directoryId, currentSubdirectoryUri)
+                    createDirectoryStructure(childDirectory.subdirectoryId, currentSubdirectoryUri)
                     filesProcessed++
                 }
             }
@@ -337,22 +335,22 @@ class DriveFragment : Fragment() {
     }
 
 
-    private fun copyFilesFromGoogleDriveToLocalDirectory(directoryMap: MutableMap<String, List<DirectoryInfoContainer>>) {
+    private fun copyFilesFromGoogleDriveToLocalDirectory(subdirectoryMap: MutableMap<String, List<SubdirectoryContainer>>) {
 
         filesProcessed = 0
 
-        val directorySet = mutableSetOf<DirectoryInfoContainerFull>()
+        val subdirectorySet = mutableSetOf<SubdirectoryContainerWithParent>()
 
-        directoryMap.forEach {
+        subdirectoryMap.forEach {
             for (entry in it.value) {
-                directorySet.add(DirectoryInfoContainerFull(entry.directoryId, entry.directoryName, entry.directoryUri, it.key))
+                subdirectorySet.add(SubdirectoryContainerWithParent(entry.subdirectoryId, entry.subdirectoryName, entry.subdirectoryUri, it.key))
             }
         }
 
         getDriveService()?.let { googleDriveService ->
 
             fun fetchParentUriFromParentId(parentId: String): Uri? {
-                val matchingDirectoryInfoContainer = directorySet.find {
+                val matchingDirectoryInfoContainer = subdirectorySet.find {
                     it.directoryId == parentId
                 }
 
@@ -370,12 +368,12 @@ class DriveFragment : Fragment() {
 
                 val parentUri = fetchParentUriFromParentId(parentId) ?: rootDirectoryDocumentFile!!.uri
 
-                // TODO: get rid of DocumentFile
+                // TODO: get rid of DocumentFile usage
                 val parentDocumentFile = DocumentFile.fromTreeUri(requireActivity(), parentUri)
                 val localDocumentFile = parentDocumentFile!!.createFile(file.mimeType, file.name)
 
                 localDocumentFile?.let {
-                    // TODO: wrap in try-catch, especially since IOException can occur from network issues
+                    // TODO: wrap in try-catch, since IOException can occur from network issues
                     val outputStream = requireActivity().contentResolver.openOutputStream(localDocumentFile.uri)!!
                     googleDriveService.files().get(file.id).executeMediaAndDownloadTo(outputStream)
                     outputStream.close()
@@ -398,7 +396,8 @@ class DriveFragment : Fragment() {
                         (file.mimeType).print()
                         (file.parents ?: "null").print()
 
-                        // TODO: For now we're just skipping over files from Google Apps since they need to be handled differently
+                        // TODO: For now we're just skipping over Google Workspace files since they need to be handled differently.
+                        //       For these we'll need to use googleDriveService.files().export() instead of googleDriveService.files().get().
                         if (file.mimeType != DRIVE_FOLDER_MIME_TYPE && file.mimeType.startsWith(GOOGLE_APP_FILE_MIME_TYPE_PREFIX)) {
                             continue
                         }
@@ -510,6 +509,7 @@ class DriveFragment : Fragment() {
     }
 
 
+    // TODO: throw IOException
     private suspend fun getOrCreateDirectory(parentUri: Uri, name: String): Uri? = withContext(Dispatchers.IO) {
         DocumentsContract.createDocument(
             requireActivity().contentResolver, parentUri, DocumentsContract.Document.MIME_TYPE_DIR, name
