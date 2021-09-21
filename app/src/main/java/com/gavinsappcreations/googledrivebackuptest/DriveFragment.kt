@@ -36,6 +36,8 @@ import com.google.api.services.drive.DriveScopes
 import com.google.api.services.drive.model.File
 import kotlinx.coroutines.*
 import kotlinx.coroutines.tasks.await
+import org.w3c.dom.Document
+import java.io.FileOutputStream
 import java.util.*
 
 
@@ -94,6 +96,7 @@ class DriveFragment : Fragment() {
     private val viewModel by viewModels<DriveViewModel>()
     private lateinit var binding: FragmentDriveBinding
 
+    private lateinit var uriToUpload: Uri
 
     override fun onCreateView(
         inflater: LayoutInflater, container: ViewGroup?,
@@ -130,6 +133,19 @@ class DriveFragment : Fragment() {
                 }
             }
 
+        // Here we specify what to do with the Uri of the file we chose to upload
+        val pickFileToUploadLauncher: ActivityResultLauncher<Intent> =
+            registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+                if (result.resultCode == Activity.RESULT_OK) {
+                    val uri = result.data!!.data!!
+                    uriToUpload = uri
+                    Toast.makeText(requireActivity(), "Uri of file to upload: $uri", Toast.LENGTH_SHORT).show()
+
+                } else {
+                    Toast.makeText(requireActivity(), "pick file to upload request cancelled", Toast.LENGTH_SHORT).show()
+                }
+            }
+
         updateRootDirectoryUri(verifyAndFetchRootDirectoryUri())
         val googleAccount = GoogleSignIn.getLastSignedInAccount(requireActivity())
         viewModel.updateUserGoogleSignInAccount(googleAccount)
@@ -153,6 +169,10 @@ class DriveFragment : Fragment() {
 
         binding.restoreButton.setOnClickListener {
             startRestoreProcedure()
+        }
+
+        binding.pickFileToUploadButton.setOnClickListener {
+            pickFileToUpload(pickFileToUploadLauncher)
         }
 
         return binding.root
@@ -196,17 +216,50 @@ class DriveFragment : Fragment() {
     //       3) Iterate through files/folders and upload them one by one to Google Drive.
     //          For files < 5MB use uploadType=multipart. Else, use uploadType=resumable.
     private fun startRestoreProcedure() {
+        lifecycleScope.launch(Dispatchers.IO) {
+
+            // TODO: can we just get the File path of the root directory somehow and use File operations on each File we find?
+
+            val googleDriveService = viewModel.viewState.value.googleDriveService!!
+
+            val fileMetadata = File()
+            //val fileName = "IMG-20200420-WA0000.jpg"
+            val fileName = "img.jpg"
+            val fileNameTemp = "img_temp.jpg"
+            fileMetadata.name = fileName
+            //val filePath = java.io.File("files/photo.jpg")
+            //val filePath = java.io.File(viewModel.viewState.value.rootDirectoryUri!!.path, fileName)
+
+            val rootUri = viewModel.viewState.value.rootDirectoryUri!!
 
 
-        val fileMetadata = File()
-        fileMetadata.name = "photo.jpg"
-        val filePath = java.io.File("files/photo.jpg")
-        val mediaContent = FileContent("image/jpeg", filePath)
-        val googleDriveService = viewModel.viewState.value.googleDriveService!!
-        val file: File = googleDriveService.files().create(fileMetadata, mediaContent)
-            .setFields("id")
-            .execute()
-        println("File ID: " + file.id)
+/*            val documentId = DocumentsContract.getDocumentId()
+            val fileUri = DocumentsContract.buildDocumentUriUsingTree(rootUri, fileName)*/
+
+
+            //val rootDocumentFile = DocumentFile.fromTreeUri(requireActivity(), rootUri)
+
+            val listOfFiles = rootDirectoryDocumentFile!!.listFiles()
+
+            val firstFile = listOfFiles[0]
+
+            listOfFiles.print()
+
+            val tempFile: java.io.File = java.io.File(requireActivity().externalCacheDir, fileNameTemp)
+            tempFile.createNewFile()
+            fileMetadata.name = fileNameTemp
+            val outputStream = FileOutputStream(tempFile)
+            val inputStream = requireActivity().contentResolver.openInputStream(firstFile.uri)!!
+            inputStream.copyTo(outputStream)
+            outputStream.flush()
+
+            val mediaContent = FileContent("image/jpeg", tempFile)
+            val file: File = googleDriveService.files().create(fileMetadata, mediaContent)
+                .setFields("id")
+                .execute()
+            println("File ID: " + file.id)
+
+        }
     }
 
 
@@ -500,6 +553,13 @@ class DriveFragment : Fragment() {
     private fun promptForPermissionsInSAF(resultLauncher: ActivityResultLauncher<Intent>) {
         val permissionIntent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
         resultLauncher.launch(permissionIntent)
+    }
+
+    private fun pickFileToUpload(resultLauncher: ActivityResultLauncher<Intent>) {
+        val pickFileToUploadIntent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+        pickFileToUploadIntent.addCategory(Intent.CATEGORY_OPENABLE)
+        pickFileToUploadIntent.type = "image/*"
+        resultLauncher.launch(pickFileToUploadIntent)
     }
 
 
