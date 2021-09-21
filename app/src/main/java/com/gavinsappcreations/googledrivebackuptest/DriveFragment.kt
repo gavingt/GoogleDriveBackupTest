@@ -36,7 +36,6 @@ import com.google.api.services.drive.DriveScopes
 import com.google.api.services.drive.model.File
 import kotlinx.coroutines.*
 import kotlinx.coroutines.tasks.await
-import org.w3c.dom.Document
 import java.io.FileOutputStream
 import java.util.*
 
@@ -218,51 +217,50 @@ class DriveFragment : Fragment() {
     private fun startRestoreProcedure() {
         lifecycleScope.launch(Dispatchers.IO) {
 
-            // TODO: can we just get the File path of the root directory somehow and use File operations on each File we find?
-
-            val googleDriveService = viewModel.viewState.value.googleDriveService!!
-
-            val fileMetadata = File()
-            //val fileName = "IMG-20200420-WA0000.jpg"
-            val fileName = "img.jpg"
-            val fileNameTemp = "img_temp.jpg"
-            fileMetadata.name = fileName
-            //val filePath = java.io.File("files/photo.jpg")
-            //val filePath = java.io.File(viewModel.viewState.value.rootDirectoryUri!!.path, fileName)
-
-            val rootUri = viewModel.viewState.value.rootDirectoryUri!!
-
-
-/*            val documentId = DocumentsContract.getDocumentId()
-            val fileUri = DocumentsContract.buildDocumentUriUsingTree(rootUri, fileName)*/
-
-
-            //val rootDocumentFile = DocumentFile.fromTreeUri(requireActivity(), rootUri)
+            val driveService = viewModel.viewState.value.googleDriveService!!
 
             val listOfFiles = rootDirectoryDocumentFile!!.listFiles()
 
-            val firstFile = listOfFiles[0]
+            val cacheDirectory = requireActivity().externalCacheDir
 
-            listOfFiles.print()
+            for (file in listOfFiles) {
+                if (file.isDirectory) {
+                    val fileMetadata = File().apply {
+                        name = file.name
+                        mimeType = "application/vnd.google-apps.folder"
+                    }
 
-            val tempFile: java.io.File = java.io.File(requireActivity().externalCacheDir, fileNameTemp)
-            tempFile.createNewFile()
-            fileMetadata.name = fileNameTemp
-            val outputStream = FileOutputStream(tempFile)
-            val inputStream = requireActivity().contentResolver.openInputStream(firstFile.uri)!!
-            inputStream.copyTo(outputStream)
-            outputStream.flush()
+                    val directoryToUpload = driveService.files().create(fileMetadata)
+                        .setFields("id, name")
+                        .execute()
+                    println("Uploaded directory with name: ${directoryToUpload.name}, ID: ${directoryToUpload.id}")
+                } else {
+                    val tempFile: java.io.File = java.io.File(cacheDirectory, "tempFileName")
+                    tempFile.createNewFile()
+                    val inputStream = requireActivity().contentResolver.openInputStream(file.uri)!!
+                    val outputStream = FileOutputStream(tempFile)
+                    inputStream.copyTo(outputStream)
+                    inputStream.close()
+                    outputStream.close()
 
-            val mediaContent = FileContent("image/jpeg", tempFile)
-            val file: File = googleDriveService.files().create(fileMetadata, mediaContent)
-                .setFields("id")
-                .execute()
-            println("File ID: " + file.id)
+                    val fileMetadata = File().apply {
+                        name = file.name
+                        mimeType = file.type
+                    }
+                    val mediaContent = FileContent("image/jpeg", tempFile) // Actual file content
 
+                    val fileToUpload = driveService.files().create(fileMetadata, mediaContent)
+                        .setFields("id, name")
+                        .execute()
+                    println("Upload file with name: ${fileToUpload.name}, ID: ${fileToUpload.id}")
+                }
+            }
+            cacheDirectory?.deleteRecursively()
         }
     }
 
 
+    
     private fun startBackupProcedure() {
 
         viewModel.updateIsBackupInProgress(true)
@@ -286,7 +284,6 @@ class DriveFragment : Fragment() {
                 createDirectoryStructure(googleDriveRootDirectoryId.data, backupDirectoryUri)
 
                 copyFilesFromGoogleDriveToLocalDirectory(directoryMap)
-
             }
         }
     }
@@ -332,7 +329,6 @@ class DriveFragment : Fragment() {
             }
 
             return Success(rootIdResult.await())
-            return Failed(Exception("Not logged into Google Drive account"))
         } catch (throwable: Throwable) {
             return Failed(throwable)
         }
@@ -382,7 +378,6 @@ class DriveFragment : Fragment() {
                 return@async directoryMap
             }
             return Success(directoryInfoResult.await())
-            return Failed(Exception("Not logged into Google Drive account"))
         } catch (throwable: Throwable) {
             return Failed(throwable)
         }
@@ -565,6 +560,7 @@ class DriveFragment : Fragment() {
 
     // TODO: throw IOException
     private suspend fun getOrCreateDirectory(parentUri: Uri, name: String): Uri? = withContext(Dispatchers.IO) {
+        // Ignore "Inappropriate blocking call method" warning, as it's a false positive.
         DocumentsContract.createDocument(
             requireActivity().contentResolver, parentUri, DocumentsContract.Document.MIME_TYPE_DIR, name
         )
@@ -619,7 +615,6 @@ class DriveFragment : Fragment() {
             ("signInResult:failed code=" + e.statusCode).print()
         }
     }
-
 
 
     private fun getDriveService(googleAccount: GoogleSignInAccount?) {
