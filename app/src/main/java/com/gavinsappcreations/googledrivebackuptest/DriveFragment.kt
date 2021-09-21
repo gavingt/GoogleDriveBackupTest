@@ -79,6 +79,7 @@ import java.util.*
 //       Also check each file being uploaded against the user's max upload size (see link for that as well)
 
 
+@Suppress("BlockingMethodInNonBlockingContext")
 class DriveFragment : Fragment() {
 
     // Map of directories whose key = parent directory id and value = list of child directories inside the parent directory.
@@ -167,7 +168,10 @@ class DriveFragment : Fragment() {
         }
 
         binding.restoreButton.setOnClickListener {
-            startRestoreProcedure()
+            lifecycleScope.launch(Dispatchers.IO) {
+                startRestoreProcedure(rootDirectoryDocumentFile!!, "root")
+                requireActivity().externalCacheDir?.deleteRecursively()
+            }
         }
 
         binding.pickFileToUploadButton.setOnClickListener {
@@ -208,18 +212,18 @@ class DriveFragment : Fragment() {
         }
     }
 
+    // TODO: test with big files
 
     // TODO: restore process:
     //       1) Enumerate files and folders in local Google Drive backup directory
     //       2) Confirm adequate free space on user's Google Drive.
     //       3) Iterate through files/folders and upload them one by one to Google Drive.
     //          For files < 5MB use uploadType=multipart. Else, use uploadType=resumable.
-    private fun startRestoreProcedure() {
-        lifecycleScope.launch(Dispatchers.IO) {
-
+    private suspend fun startRestoreProcedure(directoryBeingUploadedDocumentFile: DocumentFile, directoryBeingUploadedId: String) {
+        coroutineScope {
             val driveService = viewModel.viewState.value.googleDriveService!!
 
-            val listOfFiles = rootDirectoryDocumentFile!!.listFiles()
+            val listOfFiles = directoryBeingUploadedDocumentFile.listFiles()
 
             val cacheDirectory = requireActivity().externalCacheDir
 
@@ -228,12 +232,21 @@ class DriveFragment : Fragment() {
                     val fileMetadata = File().apply {
                         name = file.name
                         mimeType = "application/vnd.google-apps.folder"
+                        parents = Collections.singletonList(directoryBeingUploadedId)
                     }
 
                     val directoryToUpload = driveService.files().create(fileMetadata)
-                        .setFields("id, name")
+                        .setFields("id, name, parents")
                         .execute()
-                    println("Uploaded directory with name: ${directoryToUpload.name}, ID: ${directoryToUpload.id}")
+
+                    withContext(Dispatchers.Main) {
+                        ("Uploaded directory with name: ${directoryToUpload.name}, ID: ${directoryToUpload.id}").print()
+                    }
+
+                    // If we're creating a directory, run this method recursively to create files inside the directory too.
+                    launch {
+                        startRestoreProcedure(file, directoryToUpload.id)
+                    }
                 } else {
                     val tempFile: java.io.File = java.io.File(cacheDirectory, "tempFileName")
                     tempFile.createNewFile()
@@ -246,21 +259,24 @@ class DriveFragment : Fragment() {
                     val fileMetadata = File().apply {
                         name = file.name
                         mimeType = file.type
+                        parents = Collections.singletonList(directoryBeingUploadedId)
                     }
                     val mediaContent = FileContent("image/jpeg", tempFile) // Actual file content
 
                     val fileToUpload = driveService.files().create(fileMetadata, mediaContent)
                         .setFields("id, name")
                         .execute()
-                    println("Upload file with name: ${fileToUpload.name}, ID: ${fileToUpload.id}")
+
+                    withContext(Dispatchers.Main) {
+                        ("Upload file with name: ${fileToUpload.name}, ID: ${fileToUpload.id}").print()
+                    }
                 }
             }
-            cacheDirectory?.deleteRecursively()
         }
     }
 
 
-    
+
     private fun startBackupProcedure() {
 
         viewModel.updateIsBackupInProgress(true)
