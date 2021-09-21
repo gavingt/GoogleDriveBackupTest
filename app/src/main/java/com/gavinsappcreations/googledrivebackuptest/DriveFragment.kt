@@ -19,15 +19,16 @@ import androidx.fragment.app.Fragment
 import androidx.fragment.app.viewModels
 import androidx.lifecycle.asLiveData
 import androidx.lifecycle.lifecycleScope
-import com.gavinsappcreations.googledrivebackuptest.State.Failed
-import com.gavinsappcreations.googledrivebackuptest.State.Success
+import com.gavinsappcreations.googledrivebackuptest.State.*
 import com.gavinsappcreations.googledrivebackuptest.databinding.FragmentDriveBinding
 import com.google.android.gms.auth.api.signin.GoogleSignIn
+import com.google.android.gms.auth.api.signin.GoogleSignInAccount
 import com.google.android.gms.auth.api.signin.GoogleSignInClient
 import com.google.android.gms.auth.api.signin.GoogleSignInOptions
 import com.google.android.gms.common.api.ApiException
 import com.google.android.gms.common.api.Scope
 import com.google.api.client.googleapis.extensions.android.gms.auth.GoogleAccountCredential
+import com.google.api.client.http.FileContent
 import com.google.api.client.http.javanet.NetHttpTransport
 import com.google.api.client.json.jackson2.JacksonFactory
 import com.google.api.services.drive.Drive
@@ -36,6 +37,7 @@ import com.google.api.services.drive.model.File
 import kotlinx.coroutines.*
 import kotlinx.coroutines.tasks.await
 import java.util.*
+
 
 /**
  * In the app we’re building, we will need to show a ‘Searching…’ screen which counts the number of files
@@ -62,20 +64,21 @@ import java.util.*
 // TODO: Use DocumentsContract.build... methods if I need more specific operations.
 // TODO: how do I handle changes to Google Drive files mid-backup?: https://developers.google.com/drive/api/v3/reference/changes
 
-// TODO: Before restoring, check the user's free space on Google Drive: https://developers.google.com/drive/api/v3/reference/about/
-//       Also check each file being uploaded against the user's max upload size (see link for that as well)
 // TODO: Can I create the directory on demand as I'm creating the file?
 // TODO: Download metadata like total # of folders, total # files, total size of Drive,
 //       and total number of each filetype (photo/video/audio/document/others) before starting backup process.
 //       Do this all at once instead of splitting it up into folders and then files.
 // TODO: Add cancel option (by pressing backupButton while backup is in progress).
-// TODO: Use WorkManager in ForegroundService mode to disconnect the backup/restore processes from the UI:
+// TODO: Use WorkManager in ForegroundService mode to disconnect the backup/restore processes from the UI?:
 //       https://www.raywenderlich.com/20689637-scheduling-tasks-with-android-workmanager
 // TODO: make repo private (make private and then go to "Manage access" in left pane of Settings screen to invite people.
 
 
-class DriveFragment : Fragment() {
+// TODO: Before restoring, check the user's free space on Google Drive: https://developers.google.com/drive/api/v3/reference/about/
+//       Also check each file being uploaded against the user's max upload size (see link for that as well)
 
+
+class DriveFragment : Fragment() {
 
     // Map of directories whose key = parent directory id and value = list of child directories inside the parent directory.
     // If a directory doesn't have any child directories, it won't be listed as a key.
@@ -105,8 +108,8 @@ class DriveFragment : Fragment() {
         val googleSignInResultLauncher: ActivityResultLauncher<Intent> =
             registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
                 if (result.resultCode == Activity.RESULT_OK) {
-                    val data: Intent? = result.data
-                    handleSignInData(data)
+                    val data: Intent = result.data!!
+                    handleSignInPromptResult(data)
                 }
             }
 
@@ -128,13 +131,15 @@ class DriveFragment : Fragment() {
             }
 
         updateRootDirectoryUri(verifyAndFetchRootDirectoryUri())
-        updateUserGoogleSignInStatus()
+        val googleAccount = GoogleSignIn.getLastSignedInAccount(requireActivity())
+        viewModel.updateUserGoogleSignInAccount(googleAccount)
+        getDriveService(googleAccount)
 
         binding.logInButton.setOnClickListener {
-            if (viewModel.viewState.value.isUserSignedIn) {
-                signOut()
+            if (viewModel.viewState.value.googleSignInAccount == null) {
+                showSignInPrompt(googleSignInResultLauncher)
             } else {
-                startGoogleSignIn(googleSignInResultLauncher)
+                signOut()
             }
         }
 
@@ -146,6 +151,10 @@ class DriveFragment : Fragment() {
             startBackupProcedure()
         }
 
+        binding.restoreButton.setOnClickListener {
+            startRestoreProcedure()
+        }
+
         return binding.root
     }
 
@@ -155,15 +164,18 @@ class DriveFragment : Fragment() {
 
         // Here we observe and react to changes in our view's state, which is stored in our ViewModel.
         viewModel.viewState.asLiveData().observe(viewLifecycleOwner) { state ->
-            binding.backupButton.isEnabled = state.isUserSignedIn && state.rootDirectoryUri != null
-            binding.restoreButton.isEnabled = state.isUserSignedIn && state.rootDirectoryUri != null
+
+            val isBackupAndRestoreEnabled =
+                state.googleSignInAccount != null && state.googleDriveService != null && state.rootDirectoryUri != null
+
+            binding.backupButton.isEnabled = isBackupAndRestoreEnabled
+            binding.restoreButton.isEnabled = isBackupAndRestoreEnabled
             binding.progressBar.visibility = if (state.isBackupInProgress) View.VISIBLE else View.GONE
 
-            binding.logInButton.text = when (state.isUserSignedIn) {
-                true -> "Logged in as ${state.userEmailAddress}.\n\nLog out?"
-                false -> "Log into Google account"
+            binding.logInButton.text = when (state.googleSignInAccount == null) {
+                true -> "Log into Google account"
+                false -> "Logged in as ${state.googleSignInAccount!!.email}.\n\nLog out?"
             }
-
 
             binding.grantUsbPermissionsButton.text = when (state.rootDirectoryUri) {
                 null -> "Grant USB drive permissions"
@@ -175,6 +187,26 @@ class DriveFragment : Fragment() {
                 }
             }
         }
+    }
+
+
+    // TODO: restore process:
+    //       1) Enumerate files and folders in local Google Drive backup directory
+    //       2) Confirm adequate free space on user's Google Drive.
+    //       3) Iterate through files/folders and upload them one by one to Google Drive.
+    //          For files < 5MB use uploadType=multipart. Else, use uploadType=resumable.
+    private fun startRestoreProcedure() {
+
+
+        val fileMetadata = File()
+        fileMetadata.name = "photo.jpg"
+        val filePath = java.io.File("files/photo.jpg")
+        val mediaContent = FileContent("image/jpeg", filePath)
+        val googleDriveService = viewModel.viewState.value.googleDriveService!!
+        val file: File = googleDriveService.files().create(fileMetadata, mediaContent)
+            .setFields("id")
+            .execute()
+        println("File ID: " + file.id)
     }
 
 
@@ -202,9 +234,6 @@ class DriveFragment : Fragment() {
 
                 copyFilesFromGoogleDriveToLocalDirectory(directoryMap)
 
-
-            } else {
-                viewModel.updateUserGoogleSignInStatus(false)
             }
         }
     }
@@ -235,22 +264,21 @@ class DriveFragment : Fragment() {
         }
 
         try {
-            getDriveService()?.let { googleDriveService ->
-                // TODO: wrap in try-catch, since IOException can occur from network issues
-                val rootIdResult = lifecycleScope.async(Dispatchers.IO) {
-                    val result = googleDriveService.files().get("root").apply {
-                        fields = "id"
-                    }.execute()
+            // TODO: wrap in try-catch, since IOException can occur from network issues
+            val rootIdResult = lifecycleScope.async(Dispatchers.IO) {
+                val googleDriveService = viewModel.viewState.value.googleDriveService!!
+                val result = googleDriveService.files().get("root").apply {
+                    fields = "id"
+                }.execute()
 
-                    withContext(Dispatchers.Main) {
-                        ("Found root directoryId: ${result.id}").print()
-                    }
-
-                    return@async result.id
+                withContext(Dispatchers.Main) {
+                    ("Found root directoryId: ${result.id}").print()
                 }
 
-                return Success(rootIdResult.await())
+                return@async result.id
             }
+
+            return Success(rootIdResult.await())
             return Failed(Exception("Not logged into Google Drive account"))
         } catch (throwable: Throwable) {
             return Failed(throwable)
@@ -264,50 +292,48 @@ class DriveFragment : Fragment() {
         filesProcessed = 0
 
         try {
-            getDriveService()?.let { googleDriveService ->
-                val directoryInfoResult = lifecycleScope.async(Dispatchers.IO) {
-                    var pageToken: String? = null
-                    do {
-                        // TODO: wrap in try-catch, since IOException can occur from network issues
-                        val result = googleDriveService.files().list().apply {
-                            spaces = "drive"
-                            pageSize = 1000 // This gets ignored and set to a value of 460 by the API.
-                            // Select files that are folders, aren't in trash, and which user owns.
-                            q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false and 'me' in owners"
-                            fields = "nextPageToken, files(id, name, parents)"
-                            this.pageToken = pageToken
-                        }.execute()
+            val directoryInfoResult = lifecycleScope.async(Dispatchers.IO) {
+                var pageToken: String? = null
+                do {
+                    // TODO: wrap in try-catch, since IOException can occur from network issues
+                    val googleDriveService = viewModel.viewState.value.googleDriveService!!
+                    val result = googleDriveService.files().list().apply {
+                        spaces = "drive"
+                        pageSize = 1000 // This gets ignored and set to a value of 460 by the API.
+                        // Select files that are folders, aren't in trash, and which user owns.
+                        q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false and 'me' in owners"
+                        fields = "nextPageToken, files(id, name, parents)"
+                        this.pageToken = pageToken
+                    }.execute()
 
-                        for (file in result.files) {
-                            (file.name).print()
-                            (file.parents ?: "null").print()
+                    for (file in result.files) {
+                        (file.name).print()
+                        (file.parents ?: "null").print()
 
-                            val parentUri = file.parents[0]
+                        val parentUri = file.parents[0]
 
-                            if (directoryMap[parentUri] == null) {
-                                directoryMap[parentUri] = mutableListOf(SubdirectoryContainer(file.id, file.name, null))
-                            } else {
-                                directoryMap[parentUri]!!.add(SubdirectoryContainer(file.id, file.name, null))
-                            }
-
-                            withContext(Dispatchers.Main) {
-                                filesProcessed++
-                                setBackupButtonText(OperationType.DOWNLOADING_DIRECTORIES)
-                            }
+                        if (directoryMap[parentUri] == null) {
+                            directoryMap[parentUri] = mutableListOf(SubdirectoryContainer(file.id, file.name, null))
+                        } else {
+                            directoryMap[parentUri]!!.add(SubdirectoryContainer(file.id, file.name, null))
                         }
-                        pageToken = result.nextPageToken
-                    } while (pageToken != null)
 
-                    return@async directoryMap
-                }
-                return Success(directoryInfoResult.await())
+                        withContext(Dispatchers.Main) {
+                            filesProcessed++
+                            setBackupButtonText(OperationType.DOWNLOADING_DIRECTORIES)
+                        }
+                    }
+                    pageToken = result.nextPageToken
+                } while (pageToken != null)
+
+                return@async directoryMap
             }
+            return Success(directoryInfoResult.await())
             return Failed(Exception("Not logged into Google Drive account"))
         } catch (throwable: Throwable) {
             return Failed(throwable)
         }
     }
-
 
 
     private suspend fun createDirectoryStructure(directoryBeingBuiltId: String, directoryBeingBuiltUri: Uri) {
@@ -338,8 +364,8 @@ class DriveFragment : Fragment() {
     private fun copyFilesFromGoogleDriveToLocalDirectory(subdirectoryMap: MutableMap<String, List<SubdirectoryContainer>>) {
 
         filesProcessed = 0
-
         val subdirectorySet = mutableSetOf<SubdirectoryContainerWithParent>()
+        val googleDriveService = viewModel.viewState.value.googleDriveService!!
 
         subdirectoryMap.forEach {
             for (entry in it.value) {
@@ -347,77 +373,74 @@ class DriveFragment : Fragment() {
             }
         }
 
-        getDriveService()?.let { googleDriveService ->
-
-            fun fetchParentUriFromParentId(parentId: String): Uri? {
-                val matchingDirectoryInfoContainer = subdirectorySet.find {
-                    it.directoryId == parentId
-                }
-
-                matchingDirectoryInfoContainer?.let {
-                    return it.directoryUri!!
-                }
-
-                // TODO: instead return Failed(Exception("parentUri for file not found")
-                return null
+        fun fetchParentUriFromParentId(parentId: String): Uri? {
+            val matchingDirectoryInfoContainer = subdirectorySet.find {
+                it.directoryId == parentId
             }
 
-
-            fun createLocalFileFromGoogleDriveFile(file: File) {
-                val parentId = file.parents[0]
-
-                val parentUri = fetchParentUriFromParentId(parentId) ?: rootDirectoryDocumentFile!!.uri
-
-                // TODO: get rid of DocumentFile usage
-                val parentDocumentFile = DocumentFile.fromTreeUri(requireActivity(), parentUri)
-                val localDocumentFile = parentDocumentFile!!.createFile(file.mimeType, file.name)
-
-                localDocumentFile?.let {
-                    // TODO: wrap in try-catch, since IOException can occur from network issues
-                    val outputStream = requireActivity().contentResolver.openOutputStream(localDocumentFile.uri)!!
-                    googleDriveService.files().get(file.id).executeMediaAndDownloadTo(outputStream)
-                    outputStream.close()
-                }
+            matchingDirectoryInfoContainer?.let {
+                return it.directoryUri!!
             }
 
-            lifecycleScope.launch(Dispatchers.IO) {
-                var pageToken: String? = null
-                do {
-                    val result = googleDriveService.files().list().apply {
-                        spaces = "drive"
-                        // Select files that are not folders, aren't in trash, and which user owns.
-                        q = "mimeType != 'application/vnd.google-apps.folder' and trashed = false and 'me' in owners"
-                        fields = "nextPageToken, files(id, name, mimeType, parents)"
-                        this.pageToken = pageToken
-                    }.execute()
+            // TODO: instead return Failed(Exception("parentUri for file not found")
+            return null
+        }
 
-                    for (file in result.files) {
-                        (file.name).print()
-                        (file.mimeType).print()
-                        (file.parents ?: "null").print()
 
-                        // TODO: For now we're just skipping over Google Workspace files since they need to be handled differently.
-                        //       For these we'll need to use googleDriveService.files().export() instead of googleDriveService.files().get().
-                        if (file.mimeType != DRIVE_FOLDER_MIME_TYPE && file.mimeType.startsWith(GOOGLE_APP_FILE_MIME_TYPE_PREFIX)) {
-                            continue
-                        }
+        fun createLocalFileFromGoogleDriveFile(file: File) {
+            val parentId = file.parents[0]
 
-                        createLocalFileFromGoogleDriveFile(file)
+            val parentUri = fetchParentUriFromParentId(parentId) ?: rootDirectoryDocumentFile!!.uri
 
-                        // Temporarily switch back to main thread to update UI
-                        withContext(Dispatchers.Main) {
-                            filesProcessed++
-                            setBackupButtonText(OperationType.DOWNLOADING_FILES)
-                        }
+            // TODO: get rid of DocumentFile usage
+            val parentDocumentFile = DocumentFile.fromTreeUri(requireActivity(), parentUri)
+            val localDocumentFile = parentDocumentFile!!.createFile(file.mimeType, file.name)
+
+            localDocumentFile?.let {
+                // TODO: wrap in try-catch, since IOException can occur from network issues
+                val outputStream = requireActivity().contentResolver.openOutputStream(localDocumentFile.uri)!!
+                googleDriveService.files().get(file.id).executeMediaAndDownloadTo(outputStream)
+                outputStream.close()
+            }
+        }
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            var pageToken: String? = null
+            do {
+                val result = googleDriveService.files().list().apply {
+                    spaces = "drive"
+                    // Select files that are not folders, aren't in trash, and which user owns.
+                    q = "mimeType != 'application/vnd.google-apps.folder' and trashed = false and 'me' in owners"
+                    fields = "nextPageToken, files(id, name, mimeType, parents)"
+                    this.pageToken = pageToken
+                }.execute()
+
+                for (file in result.files) {
+                    (file.name).print()
+                    (file.mimeType).print()
+                    (file.parents ?: "null").print()
+
+                    // TODO: For now we're just skipping over Google Workspace files since they need to be handled differently.
+                    //       For these we'll need to use googleDriveService.files().export() instead of googleDriveService.files().get().
+                    if (file.mimeType != DRIVE_FOLDER_MIME_TYPE && file.mimeType.startsWith(GOOGLE_APP_FILE_MIME_TYPE_PREFIX)) {
+                        continue
                     }
-                    pageToken = result.nextPageToken
-                } while (pageToken != null)
 
-                viewModel.updateIsBackupInProgress(false)
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(requireActivity(), "Backup complete", Toast.LENGTH_LONG).show()
-                    setBackupButtonText(OperationType.BACKUP_COMPLETE)
+                    createLocalFileFromGoogleDriveFile(file)
+
+                    // Temporarily switch back to main thread to update UI
+                    withContext(Dispatchers.Main) {
+                        filesProcessed++
+                        setBackupButtonText(OperationType.DOWNLOADING_FILES)
+                    }
                 }
+                pageToken = result.nextPageToken
+            } while (pageToken != null)
+
+            viewModel.updateIsBackupInProgress(false)
+            withContext(Dispatchers.Main) {
+                Toast.makeText(requireActivity(), "Backup complete", Toast.LENGTH_LONG).show()
+                setBackupButtonText(OperationType.BACKUP_COMPLETE)
             }
         }
     }
@@ -447,6 +470,7 @@ class DriveFragment : Fragment() {
 
 
 // Constructs a query of the form "'folderA-ID' in parents or 'folderA1-ID' in parents or 'folderA1a-ID' in parents"
+// Use something like this for selecting specific folders/files to back up.
 /*    private fun fetchCurrentQuery(): String {
 
             var directorySelection = ROOT_DIRECTORY
@@ -473,39 +497,9 @@ class DriveFragment : Fragment() {
     }
 
 
-    private fun updateUserGoogleSignInStatus() {
-        val signedInAccount = GoogleSignIn.getLastSignedInAccount(requireActivity())
-
-        viewModel.updateUserGoogleSignInStatus(signedInAccount != null)
-
-        signedInAccount?.let {
-            viewModel.updateUserEmailAddress(signedInAccount.email)
-        }
-    }
-
-
     private fun promptForPermissionsInSAF(resultLauncher: ActivityResultLauncher<Intent>) {
         val permissionIntent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
         resultLauncher.launch(permissionIntent)
-    }
-
-
-    private fun getDriveService(): Drive? {
-        GoogleSignIn.getLastSignedInAccount(requireActivity())?.let { googleAccount ->
-            val credential = GoogleAccountCredential.usingOAuth2(
-                requireActivity(), listOf(DriveScopes.DRIVE)
-            )
-
-            credential.selectedAccount = googleAccount.account!!
-            return Drive.Builder(
-                NetHttpTransport(),
-                JacksonFactory.getDefaultInstance(),
-                credential
-            )
-                .setApplicationName(getString(R.string.app_name))
-                .build()
-        }
-        return null
     }
 
 
@@ -531,22 +525,7 @@ class DriveFragment : Fragment() {
     }
 
 
-    private fun copyFilesFromLocalDirectoryToGoogleDrive() {
-        // https://developers.google.com/drive/api/v3/folder
-        // https://commonsware.com/blog/2019/11/09/scoped-storage-stories-trees.html
-
-/*        We can call file.parents = ... to set a file's parents directly:
-        val file = File()
-        file.parents = listOf("idOfParent1", "idOfParent2")*/
-    }
-
-
     // Uses https://developers.google.com/identity/sign-in/android/start
-    private fun startGoogleSignIn(resultLauncher: ActivityResultLauncher<Intent>) {
-        val signInIntent = getGoogleSignInClient().signInIntent
-        resultLauncher.launch(signInIntent)
-    }
-
     private fun getGoogleSignInClient(): GoogleSignInClient {
         val signInOptions = GoogleSignInOptions
             .Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
@@ -560,39 +539,59 @@ class DriveFragment : Fragment() {
     }
 
 
+    // Brings up prompt for user to select Google Account with which to sign in.
+    private fun showSignInPrompt(resultLauncher: ActivityResultLauncher<Intent>) {
+        val signInIntent = getGoogleSignInClient().signInIntent
+        resultLauncher.launch(signInIntent)
+    }
+
+
+    // This gets called after a user has selected a Google Account and signed into it.
+    private fun handleSignInPromptResult(data: Intent) {
+        try {
+            val getAccountTask = GoogleSignIn.getSignedInAccountFromIntent(data)
+            val googleAccount = getAccountTask.getResult(ApiException::class.java)
+            viewModel.updateUserGoogleSignInAccount(googleAccount)
+            getDriveService(googleAccount)
+        } catch (e: ApiException) {
+            // The ApiException status code indicates the detailed failure reason.
+            // Please refer to the GoogleSignInStatusCodes class reference for more information.
+            ("signInResult:failed code=" + e.statusCode).print()
+        }
+    }
+
+
+
+    private fun getDriveService(googleAccount: GoogleSignInAccount?) {
+        val credential = GoogleAccountCredential.usingOAuth2(
+            requireActivity(), listOf(DriveScopes.DRIVE)
+        )
+        credential.selectedAccount = googleAccount?.account
+        val googleDriveService = Drive.Builder(
+            NetHttpTransport(),
+            JacksonFactory.getDefaultInstance(),
+            credential
+        ).setApplicationName(getString(R.string.app_name))
+            .build()
+
+        viewModel.updateGoogleDriveService(googleDriveService)
+    }
+
+
     private fun signOut() {
         lifecycleScope.launch {
             try {
                 val signOutTask = getGoogleSignInClient().signOut()
                 signOutTask.await()
                 // Successfully signed out.
-                updateUserGoogleSignInStatus()
-                viewModel.updateUserEmailAddress(null)
+                viewModel.updateUserGoogleSignInAccount(null)
+                viewModel.updateGoogleDriveService(null)
                 Toast.makeText(requireActivity(), " Signed out ", Toast.LENGTH_SHORT).show()
             } catch (throwable: Throwable) {
                 Toast.makeText(requireActivity(), " Error ", Toast.LENGTH_SHORT).show()
             }
         }
     }
-
-
-    private fun handleSignInData(data: Intent?) {
-        val getAccountTask = GoogleSignIn.getSignedInAccountFromIntent(data)
-        try {
-            val account = getAccountTask.getResult(ApiException::class.java)
-            // User signed in successfully.
-            viewModel.updateUserEmailAddress(account.email)
-            updateUserGoogleSignInStatus()
-            "Scopes granted ${account.grantedScopes}".print()
-        } catch (e: ApiException) {
-            // The ApiException status code indicates the detailed failure reason.
-            // Please refer to the GoogleSignInStatusCodes class reference for more information.
-            Log.w(TAG_KOTLIN, "signInResult:failed code=" + e.statusCode)
-            // TODO: update the UI to display some sort of failure state.
-            //updateUI(null)
-        }
-    }
-
 
     companion object {
         const val TAG_KOTLIN = "TAG_KOTLIN"

@@ -3,6 +3,8 @@ package com.gavinsappcreations.googledrivebackuptest
 import android.net.Uri
 import android.view.SearchEvent
 import androidx.lifecycle.ViewModel
+import com.google.android.gms.auth.api.signin.GoogleSignInAccount
+import com.google.api.services.drive.Drive
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -13,10 +15,10 @@ class DriveViewModel : ViewModel() {
 
     // Holds current state of the Fragment.
     data class DriveState(
-        var isUserSignedIn: Boolean = false,
+        var googleSignInAccount: GoogleSignInAccount? = null,
+        var googleDriveService: Drive? = null,
         var rootDirectoryUri: Uri? = null,
         var isBackupInProgress: Boolean = false,
-        var userEmailAddress: String? = null
     )
 
     // Channel for sending one-off events from viewModel to Fragment.
@@ -31,8 +33,12 @@ class DriveViewModel : ViewModel() {
     // Public non-mutable Flow representing the state of the Fragment.
     val viewState = _viewState.asStateFlow()
 
-    fun updateUserGoogleSignInStatus(isUserSignedIn: Boolean) {
-        _viewState.update { it.copy(isUserSignedIn = isUserSignedIn) }
+    fun updateUserGoogleSignInAccount(account: GoogleSignInAccount?) {
+        _viewState.update { it.copy(googleSignInAccount = account) }
+    }
+
+    fun updateGoogleDriveService(driveService: Drive?) {
+        _viewState.update { it.copy(googleDriveService = driveService) }
     }
 
     fun updateRootDirectoryUri(uri: Uri) {
@@ -43,7 +49,4 @@ class DriveViewModel : ViewModel() {
         _viewState.update { it.copy(isBackupInProgress = isInProgress) }
     }
 
-    fun updateUserEmailAddress(emailAddress: String?) {
-        _viewState.update { it.copy(userEmailAddress = emailAddress) }
-    }
 }
