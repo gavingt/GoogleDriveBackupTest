@@ -220,7 +220,7 @@ class DriveFragment : Fragment() {
 
     //TODO: refined restore procedure:
     //     1) enumerate all local files and folders
-    //     2) enumerate all files/folders on Google Drive
+    //     2) enumerate all files/folders on Google Drive: https://github.com/rafa-guillermo/Google-Apps-Script-Useful-Snippets
     //     3) create list of all files contained locally but not on Google Drive.
     //     4) measure size of list created in step 3 (use getFilesToUploadSize() method below)
     //     5) check free space and remaining daily usage on Google Drive and ensure that list generated in step 3 can fit within it: https://developers.google.com/drive/api/v3/reference/about/
@@ -306,10 +306,10 @@ class DriveFragment : Fragment() {
         val mediaFile = createTempFile(rootDirectoryDocumentFile!!.listFiles()[0])
 
         val fileMetadata = File().apply {
-            name = "Movie.mp4"
+            name = "Photo.jpg"
         }
         val mediaContent = InputStreamContent(
-            "video/mp4",
+            "image/jpeg",
             BufferedInputStream(FileInputStream(mediaFile))
         )
         mediaContent.length = mediaFile.length()
@@ -343,6 +343,9 @@ class DriveFragment : Fragment() {
             .setDirectUploadEnabled(false)
             .upload(GenericUrl("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"))
         println(file.statusMessage)
+
+        (file.request).print()
+
     }
 
 
@@ -370,14 +373,16 @@ class DriveFragment : Fragment() {
         request.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
         request.setRequestProperty("Content-Length", java.lang.String.format(Locale.ENGLISH, "%d", requestBody.toByteArray().size))
 
+        ("Upload requestProperties: ${request.requestProperties}").print()
+
+
         val outputStream: OutputStream = request.outputStream
         outputStream.write(requestBody.toByteArray())
         outputStream.close()
 
+
         request.connect()
 
-        val responseCode = request.responseCode
-        ("Upload request response code: $responseCode").print()
 
 
         if (request.responseCode == HttpURLConnection.HTTP_OK) {
@@ -396,7 +401,7 @@ class DriveFragment : Fragment() {
         var chunkSize = (2 * MediaHttpUploader.MINIMUM_CHUNK_SIZE).toLong()
         var chunksUploaded = 0
 
-        // Here starts the upload chunk code:
+        // Upload fileToUpload once chunk at a time.
         do {
             val request = sessionUri.openConnection() as HttpURLConnection
 
@@ -417,11 +422,10 @@ class DriveFragment : Fragment() {
             request.setRequestProperty("Content-Length", java.lang.String.format(Locale.ENGLISH, "%d", chunkSize))
             request.setRequestProperty("Content-Range", "bytes " + beginningOfChunk + "-" + (beginningOfChunk + chunkSize - 1) + "/" + fileSizeInBytes)
 
-            ("Content-Range: $beginningOfChunk - ${(beginningOfChunk + chunkSize - 1)} / $fileSizeInBytes").print()
-
             val buffer = ByteArray(chunkSize.toInt())
             val fileInputStream = FileInputStream(fileToUpload)
             fileInputStream.channel.position(beginningOfChunk)
+            fileInputStream.read(buffer)
             fileInputStream.close()
 
             val outputStream = request.outputStream
@@ -444,8 +448,6 @@ class DriveFragment : Fragment() {
             }
 
         } while (request.responseCode != HttpURLConnection.HTTP_OK && request.responseCode != HttpURLConnection.HTTP_CREATED && bytesUploadedSoFar < fileSizeInBytes)
-
-        // End of upload chunk section
     }
 
 
