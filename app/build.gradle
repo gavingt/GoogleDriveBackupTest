@@ -89,10 +89,7 @@ dependencies {
     /* We need to include this to fix a bug with subtrees. For some reason this update isn't being
     rolled into the androidx libraries so we have to include it separately:
     https://developer.android.com/jetpack/androidx/releases/documentfile#1.0.1 */
-    // TODO: delete if we're no longer going to use DocumentFile (since it's slow AF)
     implementation 'androidx.documentfile:documentfile:1.0.1'
-
-
 
     // LeakCanary (for detecting memory leaks)
     //debugImplementation 'com.squareup.leakcanary:leakcanary-android:2.7'
