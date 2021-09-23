@@ -38,8 +38,11 @@ import com.google.api.client.json.jackson2.JacksonFactory
 import com.google.api.services.drive.Drive
 import com.google.api.services.drive.DriveScopes
 import com.google.api.services.drive.model.File
-import kotlinx.coroutines.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withContext
 import java.io.*
 import java.net.HttpURLConnection
 import java.net.URL
@@ -96,6 +99,8 @@ class DriveFragment : Fragment() {
     private lateinit var binding: FragmentDriveBinding
 
     private lateinit var uriToUpload: Uri
+
+    private lateinit var uploadSessionUrl: URL
 
     private lateinit var credential: GoogleAccountCredential
 
@@ -345,7 +350,6 @@ class DriveFragment : Fragment() {
         println(file.statusMessage)
 
         (file.request).print()
-
     }
 
 
@@ -358,19 +362,21 @@ class DriveFragment : Fragment() {
      */
     private suspend fun uploadResumableFileMetadata() {
 
+        withContext(Dispatchers.Main) {
+            viewModel.updateRestoreStatus(RestoreStatus.UPLOADING_FILES)
+            setRestoreButtonText(RestoreStatus.UPLOADING_FILES, 0)
+        }
+
         //val mediaDocumentFile = rootDirectoryDocumentFile!!.listFiles()[0]
         val mediaDocumentFile = DocumentFile.fromSingleUri(requireActivity(), uriToUpload)!!
         val mimeType = mediaDocumentFile.type ?: UNKNOWN_FILE_MIME_TYPE
-
         val mediaFile = createTempFile(mediaDocumentFile)
         val fileSizeInBytes = getFileSizeInBytes(mediaFile)
 
         val requestUrl = URL("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable")
-
         val requestBody = "{\"name\": \"${mediaDocumentFile.name}\"}"
 
         val request: HttpURLConnection = requestUrl.openConnection() as HttpURLConnection
-
         request.requestMethod = "POST"
         request.doInput = true
         request.doOutput = true
@@ -387,19 +393,18 @@ class DriveFragment : Fragment() {
         request.connect()
 
         if (request.responseCode == HttpURLConnection.HTTP_OK) {
-            // TODO: save this uploadSessionUrl somewhere until file is completely uploaded
-            val uploadSessionUrl = URL(request.getHeaderField("location"))
-            uploadResumableFileContent(uploadSessionUrl, fileSizeInBytes, mediaFile, mimeType)
+            uploadSessionUrl = URL(request.getHeaderField("location"))
+            uploadResumableFileContent(mediaFile, fileSizeInBytes, mimeType)
         } else {
-            // TODO: retry or throw IOException?
+            throw IOException("Unable to start upload")
         }
     }
 
 
-    private suspend fun uploadResumableFileContent(uploadSessionUrl: URL, fileSizeInBytes: Int, fileToUpload: java.io.File, mimeType: String) {
+    private suspend fun uploadResumableFileContent(fileToUpload: java.io.File, fileSizeInBytes: Int, mimeType: String) {
 
         var beginningOfChunk: Long = 0
-        var chunkSize = (2 * MediaHttpUploader.MINIMUM_CHUNK_SIZE).toLong()
+        var chunkSize = (4 * MediaHttpUploader.MINIMUM_CHUNK_SIZE).toLong()
         var chunksUploaded = 0
 
         // Upload fileToUpload once chunk at a time.
@@ -461,10 +466,11 @@ class DriveFragment : Fragment() {
         )
 
         withContext(Dispatchers.Main) {
-            Snackbar.make(binding.root,  "Restore complete!", Snackbar.LENGTH_LONG).show()
+            Snackbar.make(binding.root, "Restore complete!", Snackbar.LENGTH_LONG).show()
             setRestoreButtonText(RestoreStatus.INACTIVE)
         }
     }
+
 
 
     fun getFilesToUploadSize(filesToBeUploaded: List<java.io.File>): Long {
@@ -483,20 +489,13 @@ class DriveFragment : Fragment() {
 
 
     private fun startBackupProcedure() {
-
         lifecycleScope.launch(Dispatchers.IO) {
-
             try {
                 deleteAllFilesInBackupDirectory()
-
                 val googleDriveRootDirectoryId = fetchGoogleDriveRootDirectoryId()
-
                 downloadDirectoryInfo()
-
                 val backupDirectoryUri = getOrCreateDirectory(rootDirectoryDocumentFile!!.uri, BACKUP_DIRECTORY)!!
-
                 createDirectoryStructure(googleDriveRootDirectoryId, backupDirectoryUri)
-
                 copyFilesFromGoogleDriveToLocalDirectory(directoryMap)
             } catch (throwable: Throwable) {
                 withContext(Dispatchers.Main) {
@@ -754,7 +753,6 @@ class DriveFragment : Fragment() {
     }
 
 
-
     private fun promptForPermissionsInSAF(resultLauncher: ActivityResultLauncher<Intent>) {
         val permissionIntent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
         resultLauncher.launch(permissionIntent)
@@ -769,7 +767,6 @@ class DriveFragment : Fragment() {
 
 
     private suspend fun getOrCreateDirectory(parentUri: Uri, name: String): Uri? = withContext(Dispatchers.IO) {
-        // Ignore "Inappropriate blocking call method" warning, as it's a false positive.
         DocumentsContract.createDocument(
             requireActivity().contentResolver, parentUri, DocumentsContract.Document.MIME_TYPE_DIR, name
         )
@@ -778,7 +775,7 @@ class DriveFragment : Fragment() {
 
     private fun setBackupButtonText(backupStatus: BackupStatus) {
         val suffix = when (backupStatus) {
-            BackupStatus.INACTIVE -> requireActivity().getString(R.string.backup_button_text)
+            BackupStatus.INACTIVE -> ""
             BackupStatus.DELETING_OLD_FILES -> "Deleting old backup files..."
             BackupStatus.FETCHING_ROOT_DIRECTORY_ID -> "Fetching root directory id..."
             BackupStatus.DOWNLOADING_DIRECTORY_INFO -> "Directories downloaded: $filesProcessed"
@@ -786,18 +783,18 @@ class DriveFragment : Fragment() {
             BackupStatus.DOWNLOADING_FILES -> "Files downloaded: $filesProcessed"
         }
 
-        binding.backupButton.text = requireActivity().getString(R.string.backup_button_text, suffix)
+        binding.backupButton.text = requireActivity().getString(R.string.backup_button_text, suffix).trim()
     }
 
 
     private fun setRestoreButtonText(newRestoreStatus: RestoreStatus, completionPercentage: Int? = null) {
         val suffix = when (newRestoreStatus) {
-            RestoreStatus.INACTIVE -> requireActivity().getString(R.string.restore_button_text)
+            RestoreStatus.INACTIVE -> ""
             RestoreStatus.UPLOADING_FILES -> "Files uploaded: $filesProcessed\nCurrent file: $completionPercentage% complete"
             RestoreStatus.UPLOAD_PAUSED -> "Upload paused"
         }
 
-        binding.restoreButton.text = requireActivity().getString(R.string.restore_button_text, suffix)
+        binding.restoreButton.text = requireActivity().getString(R.string.restore_button_text, suffix).trim()
     }
 
 
