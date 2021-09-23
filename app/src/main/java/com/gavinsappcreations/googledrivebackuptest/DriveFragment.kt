@@ -70,11 +70,13 @@ import java.util.*
 // TODO: get rid of DocumentFiles usages, especially listFiles() when I don't need all the files it returns (use buildChildDocumentsUriUsingTree() to fetch a URI that we can query to get child URIs)
 
 // TODO: Should we copy files that were "shared with me"?
+// TODO: Test parallel uploads/downloads. Parallel uploading for small files in particular is potentially much faster.
 // TODO: Do we need to worry about a file having multiple parents? Right now we're just using first parent.
 // TODO: how do I handle changes to Google Drive files mid-backup?: https://developers.google.com/drive/api/v3/reference/changes
 // TODO: error handling (both local and on network): https://developers.google.com/drive/api/v3/handle-errors#resolve_a_403_error_rate_limit_exceeded
 // TODO: only allow backup/restore on wifi
 // TODO: add try-catch to each method, and in catch block throw exceptions with custom messages
+// TODO: store ids in sqlite for each file/folder backup up (and possibly for restored items as well)
 
 // TODO: Create the directory on demand as I'm creating the file.
 // TODO: Download metadata like total # of folders, total # files, total size of Drive,
@@ -212,36 +214,33 @@ class DriveFragment : Fragment() {
 
 
     private suspend fun startRestoreProcedure(directoryBeingUploadedDocumentFile: DocumentFile, directoryBeingUploadedId: String) {
-        coroutineScope {
-            val driveService = viewModel.viewState.value.googleDriveService!!
+        val driveService = viewModel.viewState.value.googleDriveService!!
 
-            val listOfFiles = directoryBeingUploadedDocumentFile.listFiles()
-            for (documentFileToUpload in listOfFiles) {
-                when (documentFileToUpload.isDirectory) {
-                    true -> {
-                        val fileMetadata = File().apply {
-                            name = documentFileToUpload.name
-                            mimeType = "application/vnd.google-apps.folder"
-                            parents = Collections.singletonList(directoryBeingUploadedId)
-                        }
-
-                        val directoryToUpload = driveService.files().create(fileMetadata)
-                            .setFields("id, name, parents")
-                            .execute()
-
-                        withContext(Dispatchers.Main) {
-                            ("Uploaded directory with name: ${directoryToUpload.name}, ID: ${directoryToUpload.id}").print()
-                        }
-
-                        // Run startRestoreProcedure() recursively to create documents inside this branch next.
-                        launch {
-                            startRestoreProcedure(documentFileToUpload, directoryToUpload.id)
-                        }
+        val listOfFiles = directoryBeingUploadedDocumentFile.listFiles()
+        for (documentFileToUpload in listOfFiles) {
+            when (documentFileToUpload.isDirectory) {
+                true -> {
+                    val fileMetadata = File().apply {
+                        name = documentFileToUpload.name
+                        mimeType = "application/vnd.google-apps.folder"
+                        parents = Collections.singletonList(directoryBeingUploadedId)
                     }
-                    false -> when (documentFileToUpload.length()) {
-                        in 0..FIVE_MEGABYTES_IN_BYTES -> uploadSmallFile(documentFileToUpload, directoryBeingUploadedId)
-                        else -> uploadLargeFileMetadata(documentFileToUpload, directoryBeingUploadedId)
+
+                    val directoryToUpload = driveService.files().create(fileMetadata)
+                        .setFields("id, name, parents")
+                        .execute()
+
+                    withContext(Dispatchers.Main) {
+                        ("Uploaded directory with name: ${directoryToUpload.name}, ID: ${directoryToUpload.id}").print()
                     }
+                    filesProcessed++
+                    setRestoreButtonText(RestoreStatus.UPLOADING_FILES)
+                    // Run startRestoreProcedure() recursively to create documents inside this branch next.
+                    startRestoreProcedure(documentFileToUpload, directoryToUpload.id)
+                }
+                false -> when (documentFileToUpload.length()) {
+                    in 0..FIVE_MEGABYTES_IN_BYTES -> uploadSmallFile(documentFileToUpload, directoryBeingUploadedId)
+                    else -> uploadLargeFileMetadata(documentFileToUpload, directoryBeingUploadedId)
                 }
             }
         }
@@ -252,7 +251,7 @@ class DriveFragment : Fragment() {
      * We use this method for files < 5MB, since it lets us send metadata and file content in one HTTP request.
      * This corresponds to https://developers.google.com/drive/api/v3/manage-uploads#multipart
      */
-    private fun uploadSmallFile(documentFileToUpload: DocumentFile, parentId: String) {
+    private suspend fun uploadSmallFile(documentFileToUpload: DocumentFile, parentId: String) {
         val googleDriveService = viewModel.viewState.value.googleDriveService!!
         val tempJavaFile = createTempFileFromDocumentFile(requireActivity(), documentFileToUpload)
 
@@ -264,6 +263,8 @@ class DriveFragment : Fragment() {
         googleDriveService.files().create(fileMetadata, mediaContent)
             .setFields("id, parents")
             .execute()
+        filesProcessed++
+        setRestoreButtonText(RestoreStatus.UPLOADING_FILES)
     }
 
 
@@ -628,19 +629,6 @@ class DriveFragment : Fragment() {
     }
 
 
-// Constructs a query of the form "'folderA-ID' in parents or 'folderA1-ID' in parents or 'folderA1a-ID' in parents"
-// Use something like this for selecting specific folders/files to back up.
-/*    private fun fetchCurrentQuery(): String {
-
-            var directorySelection = ROOT_DIRECTORY
-            for (directory in directoryIdsAndParentIds) {
-                directorySelection = directorySelection.plus("'${directory.key}' in parents")
-                directorySelection = directorySelection.plus(" or ")
-            }
-            return directorySelection.plus(" and trashed = false")
-    }*/
-
-
     private fun updateRootDirectoryUri(uri: Uri?) {
         uri?.let {
             rootDirectoryDocumentFile = DocumentFile.fromTreeUri(requireActivity(), uri)!!
@@ -690,8 +678,6 @@ class DriveFragment : Fragment() {
         val signInOptions = GoogleSignInOptions
             .Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
             .requestEmail()
-            // Ask for permission to modify everything on user's Drive.
-            // TODO: only request scope needed for current task - DRIVE for writing and DRIVE_READONLY for reading
             .requestScopes(Scope(DriveScopes.DRIVE))
             .build()
 

@@ -55,3 +55,16 @@ suspend fun getOrCreateDirectory(activity: Activity, parentUri: Uri, name: Strin
         activity.contentResolver, parentUri, DocumentsContract.Document.MIME_TYPE_DIR, name
     )
 }
+
+
+// Constructs a query of the form "'folderA-ID' in parents or 'folderA1-ID' in parents or 'folderA1a-ID' in parents"
+// Use something like this for selecting specific folders/files to back up.
+/*    private fun fetchCurrentQuery(): String {
+
+            var directorySelection = ROOT_DIRECTORY
+            for (directory in directoryIdsAndParentIds) {
+                directorySelection = directorySelection.plus("'${directory.key}' in parents")
+                directorySelection = directorySelection.plus(" or ")
+            }
+            return directorySelection.plus(" and trashed = false")
+    }*/
