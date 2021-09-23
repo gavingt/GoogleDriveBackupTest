@@ -3,13 +3,16 @@ package com.gavinsappcreations.googledrivebackuptest
 import android.net.Uri
 import android.view.SearchEvent
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
 import com.google.android.gms.auth.api.signin.GoogleSignInAccount
 import com.google.api.services.drive.Drive
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 
 class DriveViewModel : ViewModel() {
 
@@ -18,7 +21,8 @@ class DriveViewModel : ViewModel() {
         var googleSignInAccount: GoogleSignInAccount? = null,
         var googleDriveService: Drive? = null,
         var rootDirectoryUri: Uri? = null,
-        var isBackupInProgress: Boolean = false,
+        var backupStatus: BackupStatus = BackupStatus.INACTIVE,
+        var restoreStatus: RestoreStatus = RestoreStatus.INACTIVE
     )
 
     // Channel for sending one-off events from viewModel to Fragment.
@@ -45,8 +49,12 @@ class DriveViewModel : ViewModel() {
         _viewState.update { it.copy(rootDirectoryUri = uri) }
     }
 
-    fun updateIsBackupInProgress(isInProgress: Boolean) {
-        _viewState.update { it.copy(isBackupInProgress = isInProgress) }
+    fun updateBackupStatus(newStatus: BackupStatus) {
+        _viewState.update { it.copy(backupStatus = newStatus) }
+    }
+
+    fun updateRestoreStatus(newStatus: RestoreStatus) {
+        _viewState.update { it.copy(restoreStatus = newStatus) }
     }
 
 }

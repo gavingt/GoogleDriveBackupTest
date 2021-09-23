@@ -35,14 +35,27 @@ data class SubdirectoryContainerWithParent(
 
 
 /**
- * Indicates the current operation that's being performed.
+ * Indicates the current step in the backup process that's being performed.
  */
-enum class OperationType {
+enum class BackupStatus {
+    INACTIVE,
     DELETING_OLD_FILES,
     FETCHING_ROOT_DIRECTORY_ID,
-    DOWNLOADING_DIRECTORIES,
+    DOWNLOADING_DIRECTORY_INFO,
     CREATING_DIRECTORIES,
-    DOWNLOADING_FILES,
-    BACKUP_COMPLETE
+    DOWNLOADING_FILES
 }
 
+
+/**
+ * Indicates the current step in the restore process that's being performed.
+ */
+enum class RestoreStatus {
+    INACTIVE,
+/*    DELETING_OLD_FILES,
+    FETCHING_ROOT_DIRECTORY_ID,
+    DOWNLOADING_DIRECTORIES,
+    CREATING_DIRECTORIES,*/
+    UPLOADING_FILES,
+    UPLOAD_PAUSED
+}

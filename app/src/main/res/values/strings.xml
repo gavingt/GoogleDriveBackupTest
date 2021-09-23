@@ -2,4 +2,6 @@
     <string name="app_name">GoogleDriveBackupTest</string>
 
     <string name="backup_button_text">Copy files from Google Drive to local directory\n\n%1$s</string>
+    <string name="restore_button_text">Copy files from local directory to Google Drive\n\n%1$s</string>
+
 </resources>

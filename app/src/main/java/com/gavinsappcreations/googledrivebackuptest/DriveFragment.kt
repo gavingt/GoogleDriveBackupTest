@@ -19,7 +19,6 @@ import androidx.fragment.app.Fragment
 import androidx.fragment.app.viewModels
 import androidx.lifecycle.asLiveData
 import androidx.lifecycle.lifecycleScope
-import com.gavinsappcreations.googledrivebackuptest.State.*
 import com.gavinsappcreations.googledrivebackuptest.databinding.FragmentDriveBinding
 import com.google.android.gms.auth.api.signin.GoogleSignIn
 import com.google.android.gms.auth.api.signin.GoogleSignInAccount
@@ -27,6 +26,7 @@ import com.google.android.gms.auth.api.signin.GoogleSignInClient
 import com.google.android.gms.auth.api.signin.GoogleSignInOptions
 import com.google.android.gms.common.api.ApiException
 import com.google.android.gms.common.api.Scope
+import com.google.android.material.snackbar.Snackbar
 import com.google.api.client.googleapis.extensions.android.gms.auth.GoogleAccountCredential
 import com.google.api.client.googleapis.media.MediaHttpUploader
 import com.google.api.client.http.FileContent
@@ -88,11 +88,8 @@ class DriveFragment : Fragment() {
     // If a directory doesn't have any child directories, it won't be listed as a key.
     private val directoryMap: MutableMap<String, List<SubdirectoryContainer>> = mutableMapOf()
 
-    var iterations = 0
-
     var filesProcessed = 0
 
-    // TODO: get rid of DocumentFile usage
     var rootDirectoryDocumentFile: DocumentFile? = null
 
     private val viewModel by viewModels<DriveViewModel>()
@@ -199,7 +196,10 @@ class DriveFragment : Fragment() {
 
             binding.backupButton.isEnabled = isBackupAndRestoreEnabled
             binding.restoreButton.isEnabled = isBackupAndRestoreEnabled
-            binding.progressBar.visibility = if (state.isBackupInProgress) View.VISIBLE else View.GONE
+            binding.progressBar.visibility = when (state.backupStatus) {
+                BackupStatus.INACTIVE -> View.GONE
+                else -> View.VISIBLE
+            }
 
             binding.logInButton.text = when (state.googleSignInAccount == null) {
                 true -> "Log into Google account"
@@ -349,10 +349,17 @@ class DriveFragment : Fragment() {
     }
 
 
-    // https://stackoverflow.com/a/62155631/7434090
-    private fun uploadResumableFileMetadata() {
+    // TODO: OutOfMemoryException for big files
+    // TODO: only allow on wifi
+    // TODO: implement actually resuming (pausing and wifi outage): use try-catch to show retry button
+    /**
+     * Upload file metadata and get a sessionUrl. SessionUrl is where we actually upload the content to.
+     * The URL is valid for one week.
+     */
+    private suspend fun uploadResumableFileMetadata() {
 
-        val mediaDocumentFile = rootDirectoryDocumentFile!!.listFiles()[0]
+        //val mediaDocumentFile = rootDirectoryDocumentFile!!.listFiles()[0]
+        val mediaDocumentFile = DocumentFile.fromSingleUri(requireActivity(), uriToUpload)!!
         val mimeType = mediaDocumentFile.type ?: UNKNOWN_FILE_MIME_TYPE
 
         val mediaFile = createTempFile(mediaDocumentFile)
@@ -360,7 +367,7 @@ class DriveFragment : Fragment() {
 
         val requestUrl = URL("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable")
 
-        val requestBody = "{\"name\": \"Photo.jpg\"}"
+        val requestBody = "{\"name\": \"${mediaDocumentFile.name}\"}"
 
         val request: HttpURLConnection = requestUrl.openConnection() as HttpURLConnection
 
@@ -373,54 +380,52 @@ class DriveFragment : Fragment() {
         request.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
         request.setRequestProperty("Content-Length", java.lang.String.format(Locale.ENGLISH, "%d", requestBody.toByteArray().size))
 
-        ("Upload requestProperties: ${request.requestProperties}").print()
-
-
         val outputStream: OutputStream = request.outputStream
         outputStream.write(requestBody.toByteArray())
         outputStream.close()
 
-
         request.connect()
 
-
-
         if (request.responseCode == HttpURLConnection.HTTP_OK) {
-            // TODO: save this sessionUri somewhere until file is completely uploaded
-            val sessionUri = URL(request.getHeaderField("location"))
-            uploadResumableFileContent(sessionUri, fileSizeInBytes, mediaFile, mimeType)
+            // TODO: save this uploadSessionUrl somewhere until file is completely uploaded
+            val uploadSessionUrl = URL(request.getHeaderField("location"))
+            uploadResumableFileContent(uploadSessionUrl, fileSizeInBytes, mediaFile, mimeType)
         } else {
-            // TODO: retry?
+            // TODO: retry or throw IOException?
         }
     }
 
 
-    private fun uploadResumableFileContent(sessionUri: URL, fileSizeInBytes: Int, fileToUpload: java.io.File, mimeType: String) {
-        // set these variables:
+    private suspend fun uploadResumableFileContent(uploadSessionUrl: URL, fileSizeInBytes: Int, fileToUpload: java.io.File, mimeType: String) {
+
         var beginningOfChunk: Long = 0
         var chunkSize = (2 * MediaHttpUploader.MINIMUM_CHUNK_SIZE).toLong()
         var chunksUploaded = 0
 
         // Upload fileToUpload once chunk at a time.
         do {
-            val request = sessionUri.openConnection() as HttpURLConnection
+            withContext(Dispatchers.Main) {
+                setRestoreButtonText(RestoreStatus.UPLOADING_FILES, (beginningOfChunk * 100 / fileSizeInBytes).toInt())
+            }
 
+            val request = uploadSessionUrl.openConnection() as HttpURLConnection
             request.requestMethod = "PUT"
             request.doOutput = true
-
-            // change your timeout as you desire here:
             request.connectTimeout = 30000
             request.setRequestProperty("Content-Type", mimeType)
-
-            val bytesUploadedSoFar = chunksUploaded * chunkSize
-            bytesUploadedSoFar.print()
 
             if (beginningOfChunk + chunkSize > fileSizeInBytes) {
                 chunkSize = fileSizeInBytes - beginningOfChunk
             }
 
-            request.setRequestProperty("Content-Length", java.lang.String.format(Locale.ENGLISH, "%d", chunkSize))
-            request.setRequestProperty("Content-Range", "bytes " + beginningOfChunk + "-" + (beginningOfChunk + chunkSize - 1) + "/" + fileSizeInBytes)
+            request.setRequestProperty(
+                "Content-Length",
+                java.lang.String.format(Locale.ENGLISH, "%d", chunkSize)
+            )
+            request.setRequestProperty(
+                "Content-Range",
+                "bytes " + beginningOfChunk + "-" + (beginningOfChunk + chunkSize - 1) + "/" + fileSizeInBytes
+            )
 
             val buffer = ByteArray(chunkSize.toInt())
             val fileInputStream = FileInputStream(fileToUpload)
@@ -433,11 +438,14 @@ class DriveFragment : Fragment() {
             outputStream.close()
             request.connect()
 
-            request.responseCode.print()
-            request.responseMessage.print()
+            ("Code ${request.responseCode} - ${request.responseMessage}, " +
+                    "Byte range uploaded successfully: ${request.getHeaderField("Range")}").print()
 
-            ("Range header: ${request.getHeaderField("Range")}").print()
-
+            /**
+             * Parse upper range from Range header, which tells us the last byte received successfully
+             * by Google Drive. If this is equal to the last byte we sent, proceed to the next chunk.
+             * If the Range header is null, no bytes have been received and we retry first chunk.
+             */
             val rangeHeader = request.getHeaderField("Range")
             if (rangeHeader != null) {
                 val lastReceivedByte = rangeHeader.split("-")[1].toLong()
@@ -447,7 +455,15 @@ class DriveFragment : Fragment() {
                 }
             }
 
-        } while (request.responseCode != HttpURLConnection.HTTP_OK && request.responseCode != HttpURLConnection.HTTP_CREATED && bytesUploadedSoFar < fileSizeInBytes)
+        } while (request.responseCode != HttpURLConnection.HTTP_OK
+            && request.responseCode != HttpURLConnection.HTTP_CREATED
+            && viewModel.viewState.value.restoreStatus == RestoreStatus.UPLOADING_FILES
+        )
+
+        withContext(Dispatchers.Main) {
+            Snackbar.make(binding.root,  "Restore complete!", Snackbar.LENGTH_LONG).show()
+            setRestoreButtonText(RestoreStatus.INACTIVE)
+        }
     }
 
 
@@ -468,27 +484,24 @@ class DriveFragment : Fragment() {
 
     private fun startBackupProcedure() {
 
-        viewModel.updateIsBackupInProgress(true)
-
         lifecycleScope.launch(Dispatchers.IO) {
 
-            deleteAllFilesInBackupDirectory()
+            try {
+                deleteAllFilesInBackupDirectory()
 
-            val googleDriveRootDirectoryId = fetchGoogleDriveRootDirectoryId()
+                val googleDriveRootDirectoryId = fetchGoogleDriveRootDirectoryId()
 
-            val directoryInfo = fetchDirectoryInfo()
+                downloadDirectoryInfo()
 
-            if (googleDriveRootDirectoryId is Success && directoryInfo is Success) {
                 val backupDirectoryUri = getOrCreateDirectory(rootDirectoryDocumentFile!!.uri, BACKUP_DIRECTORY)!!
 
-                iterations = 0
-                directoryMap.clear()
-                directoryMap.putAll(directoryInfo.data)
-                filesProcessed = 0
-
-                createDirectoryStructure(googleDriveRootDirectoryId.data, backupDirectoryUri)
+                createDirectoryStructure(googleDriveRootDirectoryId, backupDirectoryUri)
 
                 copyFilesFromGoogleDriveToLocalDirectory(directoryMap)
+            } catch (throwable: Throwable) {
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(requireActivity(), "Error: ${throwable.message}", Toast.LENGTH_LONG).show()
+                }
             }
         }
     }
@@ -500,126 +513,122 @@ class DriveFragment : Fragment() {
      */
     private suspend fun deleteAllFilesInBackupDirectory() {
         withContext(Dispatchers.Main) {
-            setBackupButtonText(OperationType.DELETING_OLD_FILES)
+            viewModel.updateBackupStatus(BackupStatus.DELETING_OLD_FILES)
+            setBackupButtonText(BackupStatus.DELETING_OLD_FILES)
         }
         val listOfBackupDirectoryFiles: Array<DocumentFile> = rootDirectoryDocumentFile!!.listFiles()
         for (file in listOfBackupDirectoryFiles) {
             file.delete()
+        }
+
+        withContext(Dispatchers.Main) {
+            ("Old backup files deleted").print()
         }
     }
 
     // TODO: rather than a network request, in this method we should search directoryMap for the one
     //       directory that doesn't have a parent directory (that's the root)
 
-    private suspend fun fetchGoogleDriveRootDirectoryId(): State<String> {
+    private suspend fun fetchGoogleDriveRootDirectoryId(): String {
+        withContext(Dispatchers.Main) {
+            viewModel.updateBackupStatus(BackupStatus.FETCHING_ROOT_DIRECTORY_ID)
+            setBackupButtonText(BackupStatus.FETCHING_ROOT_DIRECTORY_ID)
+        }
+
+        val googleDriveService = viewModel.viewState.value.googleDriveService!!
+        val result = googleDriveService.files().get("root").apply {
+            fields = "id"
+        }.execute()
 
         withContext(Dispatchers.Main) {
-            setBackupButtonText(OperationType.FETCHING_ROOT_DIRECTORY_ID)
+            ("Found root directoryId: ${result.id}").print()
         }
 
-        try {
-            // TODO: wrap in try-catch, since IOException can occur from network issues
-            val rootIdResult = lifecycleScope.async(Dispatchers.IO) {
-                val googleDriveService = viewModel.viewState.value.googleDriveService!!
-                val result = googleDriveService.files().get("root").apply {
-                    fields = "id"
-                }.execute()
-
-                withContext(Dispatchers.Main) {
-                    ("Found root directoryId: ${result.id}").print()
-                }
-
-                return@async result.id
-            }
-
-            return Success(rootIdResult.await())
-        } catch (throwable: Throwable) {
-            return Failed(throwable)
-        }
+        return result.id
     }
 
 
-    private suspend fun fetchDirectoryInfo(): State<MutableMap<String, MutableList<SubdirectoryContainer>>> {
-
-        val directoryMap: MutableMap<String, MutableList<SubdirectoryContainer>> = mutableMapOf()
+    private suspend fun downloadDirectoryInfo() {
+        val tempDirectoryMap: MutableMap<String, MutableList<SubdirectoryContainer>> = mutableMapOf()
         filesProcessed = 0
 
-        try {
-            val directoryInfoResult = lifecycleScope.async(Dispatchers.IO) {
-                var pageToken: String? = null
-                do {
-                    // TODO: wrap in try-catch, since IOException can occur from network issues
-                    val googleDriveService = viewModel.viewState.value.googleDriveService!!
-                    val result = googleDriveService.files().list().apply {
-                        spaces = "drive"
-                        pageSize = 1000 // This gets ignored and set to a value of 460 by the API.
-                        // Select files that are folders, aren't in trash, and which user owns.
-                        q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false and 'me' in owners"
-                        fields = "nextPageToken, files(id, name, parents)"
-                        this.pageToken = pageToken
-                    }.execute()
+        viewModel.updateBackupStatus(BackupStatus.DOWNLOADING_DIRECTORY_INFO)
 
-                    for (file in result.files) {
-                        (file.name).print()
-                        (file.parents ?: "null").print()
+        var pageToken: String? = null
+        do {
+            val googleDriveService = viewModel.viewState.value.googleDriveService!!
+            val result = googleDriveService.files().list().apply {
+                spaces = "drive"
+                pageSize = 1000 // This gets ignored and set to a value of 460 by the API.
+                // Select files that are folders, aren't in trash, and which user owns.
+                q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false and 'me' in owners"
+                fields = "nextPageToken, files(id, name, parents)"
+                this.pageToken = pageToken
+            }.execute()
 
-                        val parentUri = file.parents[0]
+            for (file in result.files) {
+                (file.name).print()
+                (file.parents ?: "null").print()
 
-                        if (directoryMap[parentUri] == null) {
-                            directoryMap[parentUri] = mutableListOf(SubdirectoryContainer(file.id, file.name, null))
-                        } else {
-                            directoryMap[parentUri]!!.add(SubdirectoryContainer(file.id, file.name, null))
-                        }
+                val parentUri = file.parents[0]
 
-                        withContext(Dispatchers.Main) {
-                            filesProcessed++
-                            setBackupButtonText(OperationType.DOWNLOADING_DIRECTORIES)
-                        }
-                    }
-                    pageToken = result.nextPageToken
-                } while (pageToken != null)
+                if (tempDirectoryMap[parentUri] == null) {
+                    tempDirectoryMap[parentUri] = mutableListOf(SubdirectoryContainer(file.id, file.name, null))
+                } else {
+                    tempDirectoryMap[parentUri]!!.add(SubdirectoryContainer(file.id, file.name, null))
+                }
 
-                return@async directoryMap
+                withContext(Dispatchers.Main) {
+                    filesProcessed++
+                    setBackupButtonText(BackupStatus.DOWNLOADING_DIRECTORY_INFO)
+                }
             }
-            return Success(directoryInfoResult.await())
-        } catch (throwable: Throwable) {
-            return Failed(throwable)
-        }
+            pageToken = result.nextPageToken
+        } while (pageToken != null)
+
+        directoryMap.clear()
+        directoryMap.putAll(tempDirectoryMap)
     }
 
 
     private suspend fun createDirectoryStructure(directoryBeingBuiltId: String, directoryBeingBuiltUri: Uri) {
-        coroutineScope {
-            // Create subdirectories for all children of directoryBeingBuilt.
-            directoryMap[directoryBeingBuiltId]?.forEach { childDirectory ->
 
-                // Create a directory for each childDirectory and set its Uri in directoryMap.
-                val currentSubdirectoryUri = getOrCreateDirectory(directoryBeingBuiltUri, childDirectory.subdirectoryName)!!
-                childDirectory.subdirectoryUri = currentSubdirectoryUri
+        // This inner method is called recursively to create each branch of subdirectories.
+        suspend fun createBranch(directoryBeingBuiltId: String, directoryBeingBuiltUri: Uri) {
+            coroutineScope {
+                // Create subdirectories for all children of directoryBeingBuilt.
+                directoryMap[directoryBeingBuiltId]?.forEach { childDirectory ->
 
-                // Set the subdirectory we just built as directoryBeingBuilt and re-run this method.
-                launch {
-                    createDirectoryStructure(childDirectory.subdirectoryId, currentSubdirectoryUri)
-                    filesProcessed++
+                    // Create a directory for each childDirectory and set its Uri in directoryMap.
+                    val currentSubdirectoryUri = getOrCreateDirectory(directoryBeingBuiltUri, childDirectory.subdirectoryName)!!
+                    childDirectory.subdirectoryUri = currentSubdirectoryUri
+
+                    withContext(Dispatchers.Main) {
+                        filesProcessed++
+                        setBackupButtonText(BackupStatus.CREATING_DIRECTORIES)
+                    }
+
+                    // Set the subdirectory we just built as directoryBeingBuilt and re-run this method.
+                    launch {
+                        createBranch(childDirectory.subdirectoryId, currentSubdirectoryUri)
+                    }
                 }
             }
-
-            withContext(Dispatchers.Main) {
-                iterations++
-                "iterations: $iterations".print()
-                setBackupButtonText(OperationType.CREATING_DIRECTORIES)
-            }
         }
+
+        filesProcessed = 0
+        viewModel.updateBackupStatus(BackupStatus.CREATING_DIRECTORIES)
+        createBranch(directoryBeingBuiltId, directoryBeingBuiltUri)
     }
 
     // TODO: make downloads resumable and show progress indicator (Use HttpResponse like we do in uploadMultipartFile() method)
 
     private fun copyFilesFromGoogleDriveToLocalDirectory(subdirectoryMap: MutableMap<String, List<SubdirectoryContainer>>) {
-
         filesProcessed = 0
-        val subdirectorySet = mutableSetOf<SubdirectoryContainerWithParent>()
         val googleDriveService = viewModel.viewState.value.googleDriveService!!
 
+        // We transform subdirectoryMap into subdirectorySet, as it's faster to work with a Set in this method.
+        val subdirectorySet = mutableSetOf<SubdirectoryContainerWithParent>()
         subdirectoryMap.forEach {
             for (entry in it.value) {
                 subdirectorySet.add(SubdirectoryContainerWithParent(entry.subdirectoryId, entry.subdirectoryName, entry.subdirectoryUri, it.key))
@@ -635,24 +644,19 @@ class DriveFragment : Fragment() {
                 return it.directoryUri!!
             }
 
-            // TODO: instead return Failed(Exception("parentUri for file not found")
             return null
         }
 
 
-        fun createLocalFileFromGoogleDriveFile(file: File) {
-            val parentId = file.parents[0]
-
+        fun createLocalFileFromGoogleDriveFile(googleDriveFile: File) {
+            val parentId = googleDriveFile.parents[0]
             val parentUri = fetchParentUriFromParentId(parentId) ?: rootDirectoryDocumentFile!!.uri
-
-            // TODO: get rid of DocumentFile usage
             val parentDocumentFile = DocumentFile.fromTreeUri(requireActivity(), parentUri)
-            val localDocumentFile = parentDocumentFile!!.createFile(file.mimeType, file.name)
 
+            val localDocumentFile = parentDocumentFile!!.createFile(googleDriveFile.mimeType, googleDriveFile.name)
             localDocumentFile?.let {
-                // TODO: wrap in try-catch, since IOException can occur from network issues
                 val outputStream = requireActivity().contentResolver.openOutputStream(localDocumentFile.uri)!!
-                googleDriveService.files().get(file.id).executeMediaAndDownloadTo(outputStream)
+                googleDriveService.files().get(googleDriveFile.id).executeMediaAndDownloadTo(outputStream)
                 outputStream.close()
             }
         }
@@ -660,7 +664,7 @@ class DriveFragment : Fragment() {
         lifecycleScope.launch(Dispatchers.IO) {
             var pageToken: String? = null
             do {
-                val result = googleDriveService.files().list().apply {
+                val filesStoredOnGoogleDrive = googleDriveService.files().list().apply {
                     spaces = "drive"
                     corpora = "user"
                     // Select files that are not folders, aren't in trash, and which user owns.
@@ -669,32 +673,31 @@ class DriveFragment : Fragment() {
                     this.pageToken = pageToken
                 }.execute()
 
-                for (file in result.files) {
-                    (file.name).print()
-                    (file.mimeType).print()
-                    (file.parents ?: "null").print()
+                for (googleDriveFile in filesStoredOnGoogleDrive.files) {
+                    (googleDriveFile.name).print()
+                    (googleDriveFile.mimeType).print()
+                    (googleDriveFile.parents ?: "null").print()
 
                     // TODO: For now we're just skipping over Google Workspace files since they need to be handled differently.
                     //       For these we'll need to use googleDriveService.files().export() instead of googleDriveService.files().get().
-                    if (file.mimeType != DRIVE_FOLDER_MIME_TYPE && file.mimeType.startsWith(GOOGLE_WORKSPACE_FILE_MIME_TYPE_PREFIX)) {
+                    if (googleDriveFile.mimeType != DRIVE_FOLDER_MIME_TYPE && googleDriveFile.mimeType.startsWith(GOOGLE_WORKSPACE_FILE_MIME_TYPE_PREFIX)) {
                         continue
                     }
 
-                    createLocalFileFromGoogleDriveFile(file)
+                    createLocalFileFromGoogleDriveFile(googleDriveFile)
 
                     // Temporarily switch back to main thread to update UI
                     withContext(Dispatchers.Main) {
                         filesProcessed++
-                        setBackupButtonText(OperationType.DOWNLOADING_FILES)
+                        setBackupButtonText(BackupStatus.DOWNLOADING_FILES)
                     }
                 }
-                pageToken = result.nextPageToken
+                pageToken = filesStoredOnGoogleDrive.nextPageToken
             } while (pageToken != null)
 
-            viewModel.updateIsBackupInProgress(false)
             withContext(Dispatchers.Main) {
-                Toast.makeText(requireActivity(), "Backup complete", Toast.LENGTH_LONG).show()
-                setBackupButtonText(OperationType.BACKUP_COMPLETE)
+                Snackbar.make(binding.root, "Backup complete!", Snackbar.LENGTH_LONG).show()
+                setBackupButtonText(BackupStatus.INACTIVE)
             }
         }
     }
@@ -751,6 +754,7 @@ class DriveFragment : Fragment() {
     }
 
 
+
     private fun promptForPermissionsInSAF(resultLauncher: ActivityResultLauncher<Intent>) {
         val permissionIntent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
         resultLauncher.launch(permissionIntent)
@@ -764,7 +768,6 @@ class DriveFragment : Fragment() {
     }
 
 
-    // TODO: throw IOException
     private suspend fun getOrCreateDirectory(parentUri: Uri, name: String): Uri? = withContext(Dispatchers.IO) {
         // Ignore "Inappropriate blocking call method" warning, as it's a false positive.
         DocumentsContract.createDocument(
@@ -773,17 +776,28 @@ class DriveFragment : Fragment() {
     }
 
 
-    private fun setBackupButtonText(operationType: OperationType) {
-        val suffix = when (operationType) {
-            OperationType.DELETING_OLD_FILES -> "Deleting old backup files..."
-            OperationType.FETCHING_ROOT_DIRECTORY_ID -> "Fetching root directory id..."
-            OperationType.DOWNLOADING_DIRECTORIES -> "Directories downloaded: $filesProcessed"
-            OperationType.CREATING_DIRECTORIES -> "Directories created: $filesProcessed"
-            OperationType.DOWNLOADING_FILES -> "Files downloaded: $filesProcessed"
-            OperationType.BACKUP_COMPLETE -> "Backup complete!"
+    private fun setBackupButtonText(backupStatus: BackupStatus) {
+        val suffix = when (backupStatus) {
+            BackupStatus.INACTIVE -> requireActivity().getString(R.string.backup_button_text)
+            BackupStatus.DELETING_OLD_FILES -> "Deleting old backup files..."
+            BackupStatus.FETCHING_ROOT_DIRECTORY_ID -> "Fetching root directory id..."
+            BackupStatus.DOWNLOADING_DIRECTORY_INFO -> "Directories downloaded: $filesProcessed"
+            BackupStatus.CREATING_DIRECTORIES -> "Directories created: $filesProcessed"
+            BackupStatus.DOWNLOADING_FILES -> "Files downloaded: $filesProcessed"
         }
 
         binding.backupButton.text = requireActivity().getString(R.string.backup_button_text, suffix)
+    }
+
+
+    private fun setRestoreButtonText(newRestoreStatus: RestoreStatus, completionPercentage: Int? = null) {
+        val suffix = when (newRestoreStatus) {
+            RestoreStatus.INACTIVE -> requireActivity().getString(R.string.restore_button_text)
+            RestoreStatus.UPLOADING_FILES -> "Files uploaded: $filesProcessed\nCurrent file: $completionPercentage% complete"
+            RestoreStatus.UPLOAD_PAUSED -> "Upload paused"
+        }
+
+        binding.restoreButton.text = requireActivity().getString(R.string.restore_button_text, suffix)
     }
 
 
