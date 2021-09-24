@@ -28,7 +28,7 @@ import com.google.android.gms.common.api.Scope
 import com.google.android.material.snackbar.Snackbar
 import com.google.api.client.googleapis.extensions.android.gms.auth.GoogleAccountCredential
 import com.google.api.client.googleapis.media.MediaHttpUploader
-import com.google.api.client.http.FileContent
+import com.google.api.client.http.InputStreamContent
 import com.google.api.client.http.javanet.NetHttpTransport
 import com.google.api.client.json.jackson2.JacksonFactory
 import com.google.api.services.drive.Drive
@@ -39,7 +39,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
-import java.io.FileInputStream
+import java.io.BufferedInputStream
 import java.io.IOException
 import java.io.OutputStream
 import java.net.HttpURLConnection
@@ -65,14 +65,29 @@ import java.util.*
  * If we can enumerate all objects during ‘Searching…’, count file objects and also build folder structure, then would be great.
  */
 
+
+/**
+ * It seems Google Drive allows us to create many files/folders with the same name, as a result,
+ * I am thinking that during ‘Restore’, we probably should put all of the uploaded files into a
+ * “UB Restore” or “UB Restore (timestamp)” folder, this makes it easy for us to delete all of the
+ * restored files from Google Drive, so that we can retest the feature easily.
+ * My other question is about the createTempFileFromDocumentFile method, it seems we’re making a
+ * copy of files before uploading them, so there is a performance concern here. Also, it seems
+ * both small/large upload allow us to use java.io.InputStream instead of java.io.File,
+ * it may worth us to spend some time to look into it.
+ * */
+
+// TODO: filesProcessed count not being reset to 0 between multiple upload attempts
+// TODO: can I get file locations of the root directory and then not need to copy anything?
+
 // TODO: handle Google Workspace files
 // TODO: implement refined restore procedure
+// TODO: add try-catch to each method, and in catch block throw exceptions with custom messages
+// TODO: error handling (both local and on network): https://developers.google.com/drive/api/v3/handle-errors#resolve_a_403_error_rate_limit_exceeded
 
 // TODO: Test parallel uploads/downloads. Parallel uploading for small files in particular is potentially much faster.
-// TODO: error handling (both local and on network): https://developers.google.com/drive/api/v3/handle-errors#resolve_a_403_error_rate_limit_exceeded
 // TODO: only allow backup/restore on wifi
-// TODO: add try-catch to each method, and in catch block throw exceptions with custom messages
-// TODO: store ids in sqlite for each file/folder backup up (and possibly for restored items as well)
+// TODO: store ids in sqlite for each file/folder we back up (and possibly for restored items as well)
 
 // TODO: Create the directory on demand as I'm creating the file.
 // TODO: Download metadata like total # of folders, total # files, total size of Drive,
@@ -164,10 +179,10 @@ class DriveFragment : Fragment() {
                 viewModel.updateRestoreStatus(RestoreStatus.UPLOADING_FILES)
                 setRestoreButtonText(RestoreStatus.UPLOADING_FILES)
                 startRestoreProcedure(rootDirectoryDocumentFile!!, "root")
-                requireActivity().externalCacheDir?.deleteRecursively()
                 withContext(Dispatchers.Main) {
                     Snackbar.make(binding.root, "Restore complete!", Snackbar.LENGTH_LONG).show()
                 }
+                filesProcessed = 0
                 viewModel.updateRestoreStatus(RestoreStatus.INACTIVE)
                 setRestoreButtonText(RestoreStatus.INACTIVE)
             }
@@ -191,6 +206,7 @@ class DriveFragment : Fragment() {
 
             binding.backupButton.isEnabled = arePrerequisitesMet && !isBackupOrRestoreInProgress
             binding.restoreButton.isEnabled = arePrerequisitesMet && !isBackupOrRestoreInProgress
+            binding.grantUsbPermissionsButton.isEnabled = !isBackupOrRestoreInProgress
             binding.progressBar.visibility = when (isBackupOrRestoreInProgress) {
                 true -> View.VISIBLE
                 false -> View.GONE
@@ -469,14 +485,16 @@ class DriveFragment : Fragment() {
      */
     private suspend fun uploadSmallFile(documentFileToUpload: DocumentFile, parentId: String) {
         val googleDriveService = viewModel.viewState.value.googleDriveService!!
-        val tempJavaFile = createTempFileFromDocumentFile(requireActivity(), documentFileToUpload)
 
         val fileMetadata = File()
         fileMetadata.name = documentFileToUpload.name
         fileMetadata.parents = Collections.singletonList(parentId)
-        val mediaContent = FileContent(documentFileToUpload.type, tempJavaFile)
+        //val mediaContent = FileContent(documentFileToUpload.type, tempJavaFile)
 
-        googleDriveService.files().create(fileMetadata, mediaContent)
+        val inputStream = requireActivity().contentResolver.openInputStream(documentFileToUpload.uri)!!
+        val fileContent = InputStreamContent(documentFileToUpload.type, BufferedInputStream(inputStream))
+
+        googleDriveService.files().create(fileMetadata, fileContent)
             .setFields("id, parents")
             .execute()
         filesProcessed++
@@ -501,7 +519,8 @@ class DriveFragment : Fragment() {
         setRestoreButtonText(RestoreStatus.UPLOADING_FILES, 0)
 
         val mimeType = documentFileToUpload.type ?: UNKNOWN_FILE_MIME_TYPE
-        val mediaFile = createTempFileFromDocumentFile(requireActivity(), documentFileToUpload)
+        //val mediaFile = createTempFileFromDocumentFile(requireActivity(), documentFileToUpload)
+
         val fileSizeInBytes = documentFileToUpload.length()
 
         val requestUrl = URL("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable")
@@ -528,7 +547,7 @@ class DriveFragment : Fragment() {
 
         if (request.responseCode == HttpURLConnection.HTTP_OK) {
             val uploadSessionUrl = URL(request.getHeaderField("location"))
-            uploadLargeFileContent(mediaFile, uploadSessionUrl, fileSizeInBytes, mimeType)
+            uploadLargeFileContent(documentFileToUpload, uploadSessionUrl, fileSizeInBytes, mimeType)
         } else {
             throw IOException("Unable to start upload: HTTP response code ${request.responseCode} - ${request.responseMessage}")
         }
@@ -541,68 +560,70 @@ class DriveFragment : Fragment() {
      * https://developers.google.com/drive/api/v3/manage-uploads#resume-upload
      */
     private suspend fun uploadLargeFileContent(
-        fileToUpload: java.io.File, uploadSessionUrl: URL,
+        documentFileToUpload: DocumentFile, uploadSessionUrl: URL,
         fileSizeInBytes: Long, mimeType: String
     ) {
+
 
         var beginningOfChunk: Long = 0
         var chunkSize = (4 * MediaHttpUploader.MINIMUM_CHUNK_SIZE).toLong()
         var chunksUploaded = 0
 
-        // Upload fileToUpload once chunk at a time.
-        do {
-            setRestoreButtonText(RestoreStatus.UPLOADING_FILES, (beginningOfChunk * 100 / fileSizeInBytes).toInt())
+        val documentFileInputStream = requireActivity().contentResolver.openInputStream(documentFileToUpload.uri)!!
+        documentFileInputStream.use { inputStream ->
+            // Upload documentFileToUpload once chunk at a time.
+            do {
+                setRestoreButtonText(RestoreStatus.UPLOADING_FILES, (beginningOfChunk * 100 / fileSizeInBytes).toInt())
 
-            val request = uploadSessionUrl.openConnection() as HttpURLConnection
-            request.requestMethod = "PUT"
-            request.doOutput = true
-            request.connectTimeout = 30000
-            request.setRequestProperty("Content-Type", mimeType)
+                val request = uploadSessionUrl.openConnection() as HttpURLConnection
+                request.requestMethod = "PUT"
+                request.doOutput = true
+                request.connectTimeout = 30000
+                request.setRequestProperty("Content-Type", mimeType)
 
-            if (beginningOfChunk + chunkSize > fileSizeInBytes) {
-                chunkSize = fileSizeInBytes - beginningOfChunk
-            }
-
-            request.setRequestProperty(
-                "Content-Length",
-                java.lang.String.format(Locale.ENGLISH, "%d", chunkSize)
-            )
-            request.setRequestProperty(
-                "Content-Range",
-                "bytes " + beginningOfChunk + "-" + (beginningOfChunk + chunkSize - 1) + "/" + fileSizeInBytes
-            )
-
-            val buffer = ByteArray(chunkSize.toInt())
-            val fileInputStream = FileInputStream(fileToUpload)
-            fileInputStream.channel.position(beginningOfChunk)
-            fileInputStream.read(buffer)
-            fileInputStream.close()
-
-            val outputStream = request.outputStream
-            outputStream.write(buffer)
-            outputStream.close()
-            request.connect()
-
-            ("Code ${request.responseCode} - ${request.responseMessage}, " +
-                    "Byte range uploaded successfully: ${request.getHeaderField("Range")}").print()
-
-            /**
-             * Parse upper range from Range header, which tells us the last byte received successfully
-             * by Google Drive. If this is equal to the last byte we sent, proceed to the next chunk.
-             * If the Range header is null, no bytes have been received and we retry first chunk.
-             */
-            val rangeHeader = request.getHeaderField("Range")
-            if (rangeHeader != null) {
-                val lastReceivedByte = rangeHeader.split("-")[1].toLong()
-                if (lastReceivedByte == beginningOfChunk + chunkSize - 1) {
-                    chunksUploaded += 1
-                    beginningOfChunk = (chunksUploaded * chunkSize)
+                if (beginningOfChunk + chunkSize > fileSizeInBytes) {
+                    chunkSize = fileSizeInBytes - beginningOfChunk
                 }
-            }
 
-        } while (request.responseCode != HttpURLConnection.HTTP_OK
-            && request.responseCode != HttpURLConnection.HTTP_CREATED
-        )
+                request.setRequestProperty(
+                    "Content-Length",
+                    java.lang.String.format(Locale.ENGLISH, "%d", chunkSize)
+                )
+                request.setRequestProperty(
+                    "Content-Range",
+                    "bytes " + beginningOfChunk + "-" + (beginningOfChunk + chunkSize - 1) + "/" + fileSizeInBytes
+                )
+
+                val buffer = ByteArray(chunkSize.toInt())
+                inputStream.skip(beginningOfChunk)
+                inputStream.read(buffer)
+
+                val outputStream = request.outputStream
+                outputStream.write(buffer)
+                outputStream.close()
+                request.connect()
+
+                ("Code ${request.responseCode} - ${request.responseMessage}, " +
+                        "Byte range uploaded successfully: ${request.getHeaderField("Range")}").print()
+
+                /**
+                 * Parse upper range from Range header, which tells us the last byte received successfully
+                 * by Google Drive. If this is equal to the last byte we sent, proceed to the next chunk.
+                 * If the Range header is null, no bytes have been received and we retry first chunk.
+                 */
+                val rangeHeader = request.getHeaderField("Range")
+                if (rangeHeader != null) {
+                    val lastReceivedByte = rangeHeader.split("-")[1].toLong()
+                    if (lastReceivedByte == beginningOfChunk + chunkSize - 1) {
+                        chunksUploaded += 1
+                        beginningOfChunk = (chunksUploaded * chunkSize)
+                    }
+                }
+
+            } while (request.responseCode != HttpURLConnection.HTTP_OK
+                && request.responseCode != HttpURLConnection.HTTP_CREATED
+            )
+        }
 
         filesProcessed++
         setRestoreButtonText(RestoreStatus.UPLOADING_FILES)

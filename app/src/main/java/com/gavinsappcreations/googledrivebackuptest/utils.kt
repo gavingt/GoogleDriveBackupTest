@@ -8,24 +8,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.FileOutputStream
 
-
-/**
- * We only have a Uri pointing to the backup directory, but we need a java.io.File
- * in order to upload a document to Google Drive. So we use streams to create a
- * temporary java.io.File in externalCacheDir for each document.
- */
-fun createTempFileFromDocumentFile(activity: Activity, documentFile: DocumentFile): java.io.File {
-    val tempFile = java.io.File(activity.externalCacheDir, documentFile.name ?: "tempFileName")
-    tempFile.createNewFile()
-    val inputStream = activity.contentResolver.openInputStream(documentFile.uri)!!
-    val outputStream = FileOutputStream(tempFile)
-    inputStream.copyTo(outputStream)
-    inputStream.close()
-    outputStream.close()
-    return tempFile
-}
-
-
 fun getFileSizeInBytes(file: java.io.File): Int {
     return java.lang.String.valueOf(file.length()).toInt()
 }
