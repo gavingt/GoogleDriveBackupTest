@@ -27,7 +27,6 @@ import com.google.android.gms.common.api.ApiException
 import com.google.android.gms.common.api.Scope
 import com.google.android.material.snackbar.Snackbar
 import com.google.api.client.googleapis.extensions.android.gms.auth.GoogleAccountCredential
-import com.google.api.client.googleapis.media.MediaHttpUploader
 import com.google.api.client.http.InputStreamContent
 import com.google.api.client.http.javanet.NetHttpTransport
 import com.google.api.client.json.jackson2.JacksonFactory
@@ -77,7 +76,6 @@ import java.util.*
  * it may worth us to spend some time to look into it.
  * */
 
-// TODO: filesProcessed count not being reset to 0 between multiple upload attempts
 // TODO: can I get file locations of the root directory and then not need to copy anything?
 
 // TODO: handle Google Workspace files
@@ -385,7 +383,7 @@ class DriveFragment : Fragment() {
 
         suspend fun createLocalFileFromGoogleDriveFile(googleDriveFile: File) {
             // If file size is less than the chunk size, don't show completion percentage as it'll never update.
-            val showCompletionPercentage = googleDriveFile.getSize() > DOWNLOAD_CHUNK_SIZE_IN_BYTES
+            val showCompletionPercentage = googleDriveFile.getSize() > CHUNK_SIZE_IN_BYTES
             when (showCompletionPercentage) {
                 true -> setBackupButtonText(BackupStatus.DOWNLOADING_FILES, 0)
                 false -> setBackupButtonText(BackupStatus.DOWNLOADING_FILES)
@@ -489,7 +487,6 @@ class DriveFragment : Fragment() {
         val fileMetadata = File()
         fileMetadata.name = documentFileToUpload.name
         fileMetadata.parents = Collections.singletonList(parentId)
-        //val mediaContent = FileContent(documentFileToUpload.type, tempJavaFile)
 
         val inputStream = requireActivity().contentResolver.openInputStream(documentFileToUpload.uri)!!
         val fileContent = InputStreamContent(documentFileToUpload.type, BufferedInputStream(inputStream))
@@ -516,12 +513,13 @@ class DriveFragment : Fragment() {
      * https://developers.google.com/drive/api/v3/manage-uploads#resumable
      */
     private suspend fun uploadLargeFileMetadata(documentFileToUpload: DocumentFile, parentId: String) {
-        setRestoreButtonText(RestoreStatus.UPLOADING_FILES, 0)
-
         val mimeType = documentFileToUpload.type ?: UNKNOWN_FILE_MIME_TYPE
-        //val mediaFile = createTempFileFromDocumentFile(requireActivity(), documentFileToUpload)
-
         val fileSizeInBytes = documentFileToUpload.length()
+
+        when (fileSizeInBytes > CHUNK_SIZE_IN_BYTES) {
+            true -> setRestoreButtonText(RestoreStatus.UPLOADING_FILES, 0)
+            false -> setRestoreButtonText(RestoreStatus.UPLOADING_FILES)
+        }
 
         val requestUrl = URL("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable")
         val requestBody = "{\"name\": \"${documentFileToUpload.name}\", \"parents\": [\"$parentId\"]}"
@@ -563,17 +561,18 @@ class DriveFragment : Fragment() {
         documentFileToUpload: DocumentFile, uploadSessionUrl: URL,
         fileSizeInBytes: Long, mimeType: String
     ) {
-
-
         var beginningOfChunk: Long = 0
-        var chunkSize = (4 * MediaHttpUploader.MINIMUM_CHUNK_SIZE).toLong()
+        var chunkSize = CHUNK_SIZE_IN_BYTES.toLong()
         var chunksUploaded = 0
 
         val documentFileInputStream = requireActivity().contentResolver.openInputStream(documentFileToUpload.uri)!!
         documentFileInputStream.use { inputStream ->
             // Upload documentFileToUpload once chunk at a time.
             do {
-                setRestoreButtonText(RestoreStatus.UPLOADING_FILES, (beginningOfChunk * 100 / fileSizeInBytes).toInt())
+                when (fileSizeInBytes > CHUNK_SIZE_IN_BYTES) {
+                    true -> setRestoreButtonText(RestoreStatus.UPLOADING_FILES, (beginningOfChunk * 100 / fileSizeInBytes).toInt())
+                    false -> setRestoreButtonText(RestoreStatus.UPLOADING_FILES)
+                }
 
                 val request = uploadSessionUrl.openConnection() as HttpURLConnection
                 request.requestMethod = "PUT"
@@ -777,7 +776,7 @@ class DriveFragment : Fragment() {
         private const val THIRD_PARTY_SHORTCUT_MIME_TYPE = "application/vnd.google-apps.drive-sdk"
         private const val SHORTCUT_MIME_TYPE = "application/vnd.google-apps.shortcut"
         private const val FIVE_MEGABYTES_IN_BYTES = 5242880
-        private const val DOWNLOAD_CHUNK_SIZE_IN_BYTES = 33554432
+        private const val CHUNK_SIZE_IN_BYTES = 33554432
     }
 }
 
