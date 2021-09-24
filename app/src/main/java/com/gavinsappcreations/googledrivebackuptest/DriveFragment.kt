@@ -65,14 +65,10 @@ import java.util.*
  * If we can enumerate all objects during ‘Searching…’, count file objects and also build folder structure, then would be great.
  */
 
+// TODO: handle Google Workspace files
+// TODO: implement refined restore procedure
 
-// TODO: append timestamp to backup folder name
-// TODO: get rid of DocumentFiles usages, especially listFiles() when I don't need all the files it returns (use buildChildDocumentsUriUsingTree() to fetch a URI that we can query to get child URIs)
-
-// TODO: Should we copy files that were "shared with me"?
 // TODO: Test parallel uploads/downloads. Parallel uploading for small files in particular is potentially much faster.
-// TODO: Do we need to worry about a file having multiple parents? Right now we're just using first parent.
-// TODO: how do I handle changes to Google Drive files mid-backup?: https://developers.google.com/drive/api/v3/reference/changes
 // TODO: error handling (both local and on network): https://developers.google.com/drive/api/v3/handle-errors#resolve_a_403_error_rate_limit_exceeded
 // TODO: only allow backup/restore on wifi
 // TODO: add try-catch to each method, and in catch block throw exceptions with custom messages
@@ -116,6 +112,11 @@ class DriveFragment : Fragment() {
                 if (result.resultCode == Activity.RESULT_OK) {
                     val data: Intent = result.data!!
                     handleSignInPromptResult(data)
+                } else {
+                    Toast.makeText(
+                        requireActivity(), "Sign-in failed with resultCode: ${result.resultCode}. " +
+                                "This is probably an OAuth or debug keystore issue.", Toast.LENGTH_LONG
+                    ).show()
                 }
             }
 
@@ -182,14 +183,14 @@ class DriveFragment : Fragment() {
         // Here we observe and react to changes in our view's state, which is stored in our ViewModel.
         viewModel.viewState.asLiveData().observe(viewLifecycleOwner) { state ->
 
-            val isBackupAndRestoreEnabled =
+            val arePrerequisitesMet =
                 state.googleSignInAccount != null && state.googleDriveService != null && state.rootDirectoryUri != null
 
             val isBackupOrRestoreInProgress =
                 state.backupStatus != BackupStatus.INACTIVE || state.restoreStatus != RestoreStatus.INACTIVE
 
-            binding.backupButton.isEnabled = isBackupAndRestoreEnabled && !isBackupOrRestoreInProgress
-            binding.restoreButton.isEnabled = isBackupAndRestoreEnabled && !isBackupOrRestoreInProgress
+            binding.backupButton.isEnabled = arePrerequisitesMet && !isBackupOrRestoreInProgress
+            binding.restoreButton.isEnabled = arePrerequisitesMet && !isBackupOrRestoreInProgress
             binding.progressBar.visibility = when (isBackupOrRestoreInProgress) {
                 true -> View.VISIBLE
                 false -> View.GONE
@@ -209,6 +210,221 @@ class DriveFragment : Fragment() {
                     }
                 }
             }
+        }
+    }
+
+
+    private fun startBackupProcedure() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                deleteAllFilesInBackupDirectory()
+                val googleDriveRootDirectoryId = fetchGoogleDriveRootDirectoryId()
+                downloadDirectoryInfo()
+                val backupDirectoryUri = getOrCreateDirectory(requireActivity(), rootDirectoryDocumentFile!!.uri, BACKUP_DIRECTORY)!!
+                createDirectoryStructure(googleDriveRootDirectoryId, backupDirectoryUri)
+                copyFilesFromGoogleDriveToLocalDirectory(directoryMap)
+            } catch (throwable: Throwable) {
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(requireActivity(), "Error: ${throwable.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+
+    /**
+     * For testing purposes, delete all current files in backup directory before starting. This
+     * only deletes files in the "backup_directory" folder we create, so it won't delete your personal files
+     */
+    private suspend fun deleteAllFilesInBackupDirectory() {
+        viewModel.updateBackupStatus(BackupStatus.DELETING_OLD_FILES)
+        setBackupButtonText(BackupStatus.DELETING_OLD_FILES)
+
+        val listOfBackupDirectoryFiles: Array<DocumentFile> = rootDirectoryDocumentFile!!.listFiles()
+        for (file in listOfBackupDirectoryFiles) {
+            file.delete()
+        }
+
+        withContext(Dispatchers.Main) {
+            ("Old backup files deleted").print()
+        }
+    }
+
+    // TODO: rather than a network request, in this method we could search directoryMap for the one
+    //       directory that doesn't have a parent directory (that's the root)
+
+    private suspend fun fetchGoogleDriveRootDirectoryId(): String {
+        viewModel.updateBackupStatus(BackupStatus.FETCHING_ROOT_DIRECTORY_ID)
+        setBackupButtonText(BackupStatus.FETCHING_ROOT_DIRECTORY_ID)
+
+        val googleDriveService = viewModel.viewState.value.googleDriveService!!
+        val result = googleDriveService.files().get("root").apply {
+            fields = "id"
+        }.execute()
+
+        withContext(Dispatchers.Main) {
+            ("Found root directoryId: ${result.id}").print()
+        }
+
+        return result.id
+    }
+
+
+    private suspend fun downloadDirectoryInfo() {
+        val tempDirectoryMap: MutableMap<String, MutableList<SubdirectoryContainer>> = mutableMapOf()
+        filesProcessed = 0
+
+        viewModel.updateBackupStatus(BackupStatus.DOWNLOADING_DIRECTORY_INFO)
+
+        var pageToken: String? = null
+        do {
+            val googleDriveService = viewModel.viewState.value.googleDriveService!!
+            val result = googleDriveService.files().list().apply {
+                spaces = "drive"
+                pageSize = 1000 // This gets ignored and set to a value of 460 by the API.
+                // Select files that are folders, aren't in trash, and which user owns.
+                q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false and 'me' in owners"
+                fields = "nextPageToken, files(id, name, parents)"
+                this.pageToken = pageToken
+            }.execute()
+
+            for (file in result.files) {
+                (file.name).print()
+                (file.parents ?: "null").print()
+
+                val parentUri = file.parents[0]
+
+                if (tempDirectoryMap[parentUri] == null) {
+                    tempDirectoryMap[parentUri] = mutableListOf(SubdirectoryContainer(file.id, file.name, null))
+                } else {
+                    tempDirectoryMap[parentUri]!!.add(SubdirectoryContainer(file.id, file.name, null))
+                }
+
+                filesProcessed++
+                setBackupButtonText(BackupStatus.DOWNLOADING_DIRECTORY_INFO)
+            }
+            pageToken = result.nextPageToken
+        } while (pageToken != null)
+
+        directoryMap.clear()
+        directoryMap.putAll(tempDirectoryMap)
+    }
+
+
+    private suspend fun createDirectoryStructure(directoryBeingBuiltId: String, directoryBeingBuiltUri: Uri) {
+        // This inner method is called recursively to create each branch of subdirectories.
+        suspend fun createBranch(directoryBeingBuiltId: String, directoryBeingBuiltUri: Uri) {
+            coroutineScope {
+                // Create subdirectories for all children of directoryBeingBuilt.
+                directoryMap[directoryBeingBuiltId]?.forEach { childDirectory ->
+
+                    // Create a directory for each childDirectory and set its Uri in directoryMap.
+                    val currentSubdirectoryUri =
+                        getOrCreateDirectory(requireActivity(), directoryBeingBuiltUri, childDirectory.subdirectoryName)!!
+                    childDirectory.subdirectoryUri = currentSubdirectoryUri
+
+                    filesProcessed++
+                    setBackupButtonText(BackupStatus.CREATING_DIRECTORIES)
+
+                    // Set the subdirectory we just built as directoryBeingBuilt and re-run this method.
+                    launch {
+                        createBranch(childDirectory.subdirectoryId, currentSubdirectoryUri)
+                    }
+                }
+            }
+        }
+
+        filesProcessed = 0
+        viewModel.updateBackupStatus(BackupStatus.CREATING_DIRECTORIES)
+        createBranch(directoryBeingBuiltId, directoryBeingBuiltUri)
+    }
+
+
+    private suspend fun copyFilesFromGoogleDriveToLocalDirectory(subdirectoryMap: MutableMap<String, List<SubdirectoryContainer>>) {
+
+        setBackupButtonText(BackupStatus.DOWNLOADING_FILES)
+
+        filesProcessed = 0
+        var pageToken: String? = null
+        val googleDriveService = viewModel.viewState.value.googleDriveService!!
+
+        // We transform subdirectoryMap into subdirectorySet, as it's faster to work with a Set in this method.
+        val subdirectorySet = mutableSetOf<SubdirectoryContainerWithParent>()
+        subdirectoryMap.forEach {
+            for (entry in it.value) {
+                subdirectorySet.add(SubdirectoryContainerWithParent(entry.subdirectoryId, entry.subdirectoryName, entry.subdirectoryUri, it.key))
+            }
+        }
+
+        fun fetchParentUriFromParentId(parentId: String): Uri? {
+            val matchingDirectoryInfoContainer = subdirectorySet.find {
+                it.directoryId == parentId
+            }
+
+            matchingDirectoryInfoContainer?.let {
+                return it.directoryUri!!
+            }
+            return null
+        }
+
+        suspend fun createLocalFileFromGoogleDriveFile(googleDriveFile: File) {
+            // If file size is less than the chunk size, don't show completion percentage as it'll never update.
+            val showCompletionPercentage = googleDriveFile.getSize() > DOWNLOAD_CHUNK_SIZE_IN_BYTES
+            when (showCompletionPercentage) {
+                true -> setBackupButtonText(BackupStatus.DOWNLOADING_FILES, 0)
+                false -> setBackupButtonText(BackupStatus.DOWNLOADING_FILES)
+            }
+
+            val parentId = googleDriveFile.parents[0]
+            val parentUri = fetchParentUriFromParentId(parentId) ?: rootDirectoryDocumentFile!!.uri
+            val parentDocumentFile = DocumentFile.fromTreeUri(requireActivity(), parentUri)
+
+            val localDocumentFile = parentDocumentFile!!.createFile(googleDriveFile.mimeType, googleDriveFile.name)
+            localDocumentFile?.let {
+                val outputStream = requireActivity().contentResolver.openOutputStream(localDocumentFile.uri)!!
+                val request = googleDriveService.files().get(googleDriveFile.id)
+                request.mediaHttpDownloader.setProgressListener {
+                    lifecycleScope.launch {
+                        if (showCompletionPercentage) {
+                            setBackupButtonText(BackupStatus.DOWNLOADING_FILES, (it.progress * 100).toInt())
+                        }
+                    }
+                }
+                request.executeMediaAndDownloadTo(outputStream)
+                outputStream.close()
+            }
+
+            filesProcessed++
+        }
+
+        do {
+            val filesStoredOnGoogleDrive = googleDriveService.files().list().apply {
+                spaces = "drive"
+                corpora = "user"
+                // Select files that are not folders, aren't in trash, and which user owns.
+                q = "mimeType != 'application/vnd.google-apps.folder' and trashed = false and 'me' in owners"
+                fields = "nextPageToken, files(id, name, mimeType, parents, size)"
+                this.pageToken = pageToken
+            }.execute()
+
+            for (googleDriveFile in filesStoredOnGoogleDrive.files) {
+                ("Downloading - name: ${googleDriveFile.name}, mimeType: ${googleDriveFile.mimeType}, size: ${googleDriveFile.getSize()}").print()
+
+                // TODO: For now we're just skipping over Google Workspace files since they need to be handled differently.
+                //       For these we'll need to use googleDriveService.files().export() instead of googleDriveService.files().get().
+                if (googleDriveFile.mimeType != DRIVE_FOLDER_MIME_TYPE && googleDriveFile.mimeType.startsWith(GOOGLE_WORKSPACE_FILE_MIME_TYPE_PREFIX)) {
+                    continue
+                }
+
+                createLocalFileFromGoogleDriveFile(googleDriveFile)
+            }
+            pageToken = filesStoredOnGoogleDrive.nextPageToken
+        } while (pageToken != null)
+
+        viewModel.updateBackupStatus(BackupStatus.INACTIVE)
+        setBackupButtonText(BackupStatus.INACTIVE)
+        withContext(Dispatchers.Main) {
+            Snackbar.make(binding.root, "Backup complete!", Snackbar.LENGTH_LONG).show()
         }
     }
 
@@ -393,217 +609,6 @@ class DriveFragment : Fragment() {
     }
 
 
-    private fun startBackupProcedure() {
-        lifecycleScope.launch(Dispatchers.IO) {
-            try {
-                deleteAllFilesInBackupDirectory()
-                val googleDriveRootDirectoryId = fetchGoogleDriveRootDirectoryId()
-                downloadDirectoryInfo()
-                val backupDirectoryUri = getOrCreateDirectory(requireActivity(), rootDirectoryDocumentFile!!.uri, BACKUP_DIRECTORY)!!
-                createDirectoryStructure(googleDriveRootDirectoryId, backupDirectoryUri)
-                copyFilesFromGoogleDriveToLocalDirectory(directoryMap)
-            } catch (throwable: Throwable) {
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(requireActivity(), "Error: ${throwable.message}", Toast.LENGTH_LONG).show()
-                }
-            }
-        }
-    }
-
-
-    /**
-     * For testing purposes, delete all current files in backup directory before starting. This
-     * only deletes files in the "backup_directory" folder we create, so it won't delete your personal files
-     */
-    private suspend fun deleteAllFilesInBackupDirectory() {
-        viewModel.updateBackupStatus(BackupStatus.DELETING_OLD_FILES)
-        setBackupButtonText(BackupStatus.DELETING_OLD_FILES)
-
-        val listOfBackupDirectoryFiles: Array<DocumentFile> = rootDirectoryDocumentFile!!.listFiles()
-        for (file in listOfBackupDirectoryFiles) {
-            file.delete()
-        }
-
-        withContext(Dispatchers.Main) {
-            ("Old backup files deleted").print()
-        }
-    }
-
-    // TODO: rather than a network request, in this method we should search directoryMap for the one
-    //       directory that doesn't have a parent directory (that's the root)
-
-    private suspend fun fetchGoogleDriveRootDirectoryId(): String {
-        viewModel.updateBackupStatus(BackupStatus.FETCHING_ROOT_DIRECTORY_ID)
-        setBackupButtonText(BackupStatus.FETCHING_ROOT_DIRECTORY_ID)
-
-        val googleDriveService = viewModel.viewState.value.googleDriveService!!
-        val result = googleDriveService.files().get("root").apply {
-            fields = "id"
-        }.execute()
-
-        withContext(Dispatchers.Main) {
-            ("Found root directoryId: ${result.id}").print()
-        }
-
-        return result.id
-    }
-
-
-    private suspend fun downloadDirectoryInfo() {
-        val tempDirectoryMap: MutableMap<String, MutableList<SubdirectoryContainer>> = mutableMapOf()
-        filesProcessed = 0
-
-        viewModel.updateBackupStatus(BackupStatus.DOWNLOADING_DIRECTORY_INFO)
-
-        var pageToken: String? = null
-        do {
-            val googleDriveService = viewModel.viewState.value.googleDriveService!!
-            val result = googleDriveService.files().list().apply {
-                spaces = "drive"
-                pageSize = 1000 // This gets ignored and set to a value of 460 by the API.
-                // Select files that are folders, aren't in trash, and which user owns.
-                q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false and 'me' in owners"
-                fields = "nextPageToken, files(id, name, parents)"
-                this.pageToken = pageToken
-            }.execute()
-
-            for (file in result.files) {
-                (file.name).print()
-                (file.parents ?: "null").print()
-
-                val parentUri = file.parents[0]
-
-                if (tempDirectoryMap[parentUri] == null) {
-                    tempDirectoryMap[parentUri] = mutableListOf(SubdirectoryContainer(file.id, file.name, null))
-                } else {
-                    tempDirectoryMap[parentUri]!!.add(SubdirectoryContainer(file.id, file.name, null))
-                }
-
-                filesProcessed++
-                setBackupButtonText(BackupStatus.DOWNLOADING_DIRECTORY_INFO)
-            }
-            pageToken = result.nextPageToken
-        } while (pageToken != null)
-
-        directoryMap.clear()
-        directoryMap.putAll(tempDirectoryMap)
-    }
-
-
-    private suspend fun createDirectoryStructure(directoryBeingBuiltId: String, directoryBeingBuiltUri: Uri) {
-        // This inner method is called recursively to create each branch of subdirectories.
-        suspend fun createBranch(directoryBeingBuiltId: String, directoryBeingBuiltUri: Uri) {
-            coroutineScope {
-                // Create subdirectories for all children of directoryBeingBuilt.
-                directoryMap[directoryBeingBuiltId]?.forEach { childDirectory ->
-
-                    // Create a directory for each childDirectory and set its Uri in directoryMap.
-                    val currentSubdirectoryUri =
-                        getOrCreateDirectory(requireActivity(), directoryBeingBuiltUri, childDirectory.subdirectoryName)!!
-                    childDirectory.subdirectoryUri = currentSubdirectoryUri
-
-                    filesProcessed++
-                    setBackupButtonText(BackupStatus.CREATING_DIRECTORIES)
-
-                    // Set the subdirectory we just built as directoryBeingBuilt and re-run this method.
-                    launch {
-                        createBranch(childDirectory.subdirectoryId, currentSubdirectoryUri)
-                    }
-                }
-            }
-        }
-
-        filesProcessed = 0
-        viewModel.updateBackupStatus(BackupStatus.CREATING_DIRECTORIES)
-        createBranch(directoryBeingBuiltId, directoryBeingBuiltUri)
-    }
-
-
-    private suspend fun copyFilesFromGoogleDriveToLocalDirectory(subdirectoryMap: MutableMap<String, List<SubdirectoryContainer>>) {
-
-        setBackupButtonText(BackupStatus.DOWNLOADING_FILES)
-
-        filesProcessed = 0
-        var pageToken: String? = null
-        val googleDriveService = viewModel.viewState.value.googleDriveService!!
-
-        // We transform subdirectoryMap into subdirectorySet, as it's faster to work with a Set in this method.
-        val subdirectorySet = mutableSetOf<SubdirectoryContainerWithParent>()
-        subdirectoryMap.forEach {
-            for (entry in it.value) {
-                subdirectorySet.add(SubdirectoryContainerWithParent(entry.subdirectoryId, entry.subdirectoryName, entry.subdirectoryUri, it.key))
-            }
-        }
-
-        fun fetchParentUriFromParentId(parentId: String): Uri? {
-            val matchingDirectoryInfoContainer = subdirectorySet.find {
-                it.directoryId == parentId
-            }
-
-            matchingDirectoryInfoContainer?.let {
-                return it.directoryUri!!
-            }
-            return null
-        }
-
-        suspend fun createLocalFileFromGoogleDriveFile(googleDriveFile: File) {
-            setBackupButtonText(BackupStatus.DOWNLOADING_FILES, 0)
-
-            val parentId = googleDriveFile.parents[0]
-            val parentUri = fetchParentUriFromParentId(parentId) ?: rootDirectoryDocumentFile!!.uri
-            val parentDocumentFile = DocumentFile.fromTreeUri(requireActivity(), parentUri)
-
-            val localDocumentFile = parentDocumentFile!!.createFile(googleDriveFile.mimeType, googleDriveFile.name)
-            localDocumentFile?.let {
-                val outputStream = requireActivity().contentResolver.openOutputStream(localDocumentFile.uri)!!
-                val request = googleDriveService.files().get(googleDriveFile.id)
-
-                request.mediaHttpDownloader.setProgressListener {
-                    // We can check for other DownloadStates here as well, if needed.
-                    lifecycleScope.launch {
-                        setBackupButtonText(BackupStatus.DOWNLOADING_FILES, (it.progress * 100).toInt())
-                    }
-                }
-                request.executeMediaAndDownloadTo(outputStream)
-                outputStream.close()
-            }
-
-            filesProcessed++
-        }
-
-        do {
-            val filesStoredOnGoogleDrive = googleDriveService.files().list().apply {
-                spaces = "drive"
-                corpora = "user"
-                // Select files that are not folders, aren't in trash, and which user owns.
-                q = "mimeType != 'application/vnd.google-apps.folder' and trashed = false and 'me' in owners"
-                fields = "nextPageToken, files(id, name, mimeType, parents)"
-                this.pageToken = pageToken
-            }.execute()
-
-            for (googleDriveFile in filesStoredOnGoogleDrive.files) {
-                (googleDriveFile.name).print()
-                (googleDriveFile.mimeType).print()
-                (googleDriveFile.parents ?: "null").print()
-
-                // TODO: For now we're just skipping over Google Workspace files since they need to be handled differently.
-                //       For these we'll need to use googleDriveService.files().export() instead of googleDriveService.files().get().
-                if (googleDriveFile.mimeType != DRIVE_FOLDER_MIME_TYPE && googleDriveFile.mimeType.startsWith(GOOGLE_WORKSPACE_FILE_MIME_TYPE_PREFIX)) {
-                    continue
-                }
-
-                createLocalFileFromGoogleDriveFile(googleDriveFile)
-            }
-            pageToken = filesStoredOnGoogleDrive.nextPageToken
-        } while (pageToken != null)
-
-        setBackupButtonText(BackupStatus.INACTIVE)
-        withContext(Dispatchers.Main) {
-            Snackbar.make(binding.root, "Backup complete!", Snackbar.LENGTH_LONG).show()
-        }
-    }
-
-
     /**
      * Returns the most recent Uri the user granted us permission to.
      * Alternatively, returns null if user hasn't yet chosen a directory,
@@ -750,7 +755,8 @@ class DriveFragment : Fragment() {
         private const val UNKNOWN_FILE_MIME_TYPE = "application/octet-stream"
         private const val THIRD_PARTY_SHORTCUT_MIME_TYPE = "application/vnd.google-apps.drive-sdk"
         private const val SHORTCUT_MIME_TYPE = "application/vnd.google-apps.shortcut"
-        private const val FIVE_MEGABYTES_IN_BYTES = 5000000
+        private const val FIVE_MEGABYTES_IN_BYTES = 5242880
+        private const val DOWNLOAD_CHUNK_SIZE_IN_BYTES = 33554432
     }
 }
 
