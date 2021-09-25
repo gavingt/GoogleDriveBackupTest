@@ -76,27 +76,31 @@ import java.util.*
  * it may worth us to spend some time to look into it.
  * */
 
-// TODO: can I get file locations of the root directory and then not need to copy anything?
-
-// TODO: handle Google Workspace files
 // TODO: implement refined restore procedure
-// TODO: add try-catch to each method, and in catch block throw exceptions with custom messages
+
+// TODO: add try-catch to each method, and in catch block throw exceptions with custom messages (send exceptions to Crashlytics)
+// TODO: if a network error IOException occurs, we must retry the current file.
+//       This means we must keep a list of all filesToProcess, wrapped in a state (State.Completed, State.Pending, etc...).
+//       Then we can retry by starting with next pending file.
 // TODO: error handling (both local and on network): https://developers.google.com/drive/api/v3/handle-errors#resolve_a_403_error_rate_limit_exceeded
+// TODO: Credential should be stored and updated periodically.
+
+// TODO: Create the directory on demand as I'm creating the file (at this point can I move filesProcessed into ViewModel? Maybe as a separate Flow?).
+// TODO: Download metadata like total # of folders, total # files, total size of Drive,
+//       and total number of each filetype (photo/video/audio/document/others) before starting backup process.
+//       Do this all at once instead of splitting it up into folders and then files.
+
 
 // TODO: Test parallel uploads/downloads. Parallel uploading for small files in particular is potentially much faster.
 // TODO: only allow backup/restore on wifi
 // TODO: store ids in sqlite for each file/folder we back up (and possibly for restored items as well)
 
-// TODO: Create the directory on demand as I'm creating the file.
-// TODO: Download metadata like total # of folders, total # files, total size of Drive,
-//       and total number of each filetype (photo/video/audio/document/others) before starting backup process.
-//       Do this all at once instead of splitting it up into folders and then files.
 // TODO: Add cancel option (by pressing backupButton while backup is in progress).
 // TODO: Use WorkManager in ForegroundService mode to disconnect the backup/restore processes from the UI?:
 //       https://www.raywenderlich.com/20689637-scheduling-tasks-with-android-workmanager
 
 
-@Suppress("BlockingMethodInNonBlockingContext")
+@Suppress("BlockingMethodInNonBlockingContext") // Suppresses false positive warning messages in recursive methods.
 class DriveFragment : Fragment() {
 
     private val viewModel by viewModels<DriveViewModel>()
@@ -106,8 +110,8 @@ class DriveFragment : Fragment() {
     // If a directory doesn't have any child directories, it won't be listed as a key.
     private val directoryMap: MutableMap<String, List<SubdirectoryContainer>> = mutableMapOf()
 
-    var filesProcessed = 0
-    var rootDirectoryDocumentFile: DocumentFile? = null
+    private var filesProcessed = 0
+    private var rootDirectoryDocumentFile: DocumentFile? = null
     private lateinit var credential: GoogleAccountCredential
 
     override fun onCreateView(
@@ -240,6 +244,7 @@ class DriveFragment : Fragment() {
             } catch (throwable: Throwable) {
                 withContext(Dispatchers.Main) {
                     Toast.makeText(requireActivity(), "Error: ${throwable.message}", Toast.LENGTH_LONG).show()
+                    // TODO: send error to Crashlytics
                 }
             }
         }
@@ -297,14 +302,13 @@ class DriveFragment : Fragment() {
                 spaces = "drive"
                 pageSize = 1000 // This gets ignored and set to a value of 460 by the API.
                 // Select files that are folders, aren't in trash, and which user owns.
-                q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false and 'me' in owners"
+                q = "mimeType = '$DRIVE_FOLDER_MIME_TYPE' and trashed = false and 'me' in owners"
                 fields = "nextPageToken, files(id, name, parents)"
                 this.pageToken = pageToken
             }.execute()
 
             for (file in result.files) {
-                (file.name).print()
-                (file.parents ?: "null").print()
+                ("Downloading - Filename: ${file.name}").print()
 
                 val parentUri = file.parents[0]
 
@@ -355,7 +359,6 @@ class DriveFragment : Fragment() {
 
 
     private suspend fun copyFilesFromGoogleDriveToLocalDirectory(subdirectoryMap: MutableMap<String, List<SubdirectoryContainer>>) {
-
         setBackupButtonText(BackupStatus.DOWNLOADING_FILES)
 
         filesProcessed = 0
@@ -416,7 +419,7 @@ class DriveFragment : Fragment() {
                 spaces = "drive"
                 corpora = "user"
                 // Select files that are not folders, aren't in trash, and which user owns.
-                q = "mimeType != 'application/vnd.google-apps.folder' and trashed = false and 'me' in owners"
+                q = "mimeType != '$DRIVE_FOLDER_MIME_TYPE' and trashed = false and 'me' in owners"
                 fields = "nextPageToken, files(id, name, mimeType, parents, size)"
                 this.pageToken = pageToken
             }.execute()
@@ -424,9 +427,13 @@ class DriveFragment : Fragment() {
             for (googleDriveFile in filesStoredOnGoogleDrive.files) {
                 ("Downloading - name: ${googleDriveFile.name}, mimeType: ${googleDriveFile.mimeType}, size: ${googleDriveFile.getSize()}").print()
 
-                // TODO: For now we're just skipping over Google Workspace files since they need to be handled differently.
-                //       For these we'll need to use googleDriveService.files().export() instead of googleDriveService.files().get().
-                if (googleDriveFile.mimeType != DRIVE_FOLDER_MIME_TYPE && googleDriveFile.mimeType.startsWith(GOOGLE_WORKSPACE_FILE_MIME_TYPE_PREFIX)) {
+                /**
+                 * Just ignore Google Workspace files. These can't be exported reliably, since exporting
+                 * only works for files less than 10 MB. Also, exporting each file would mean converting
+                 * it into a format that the user's device supports, and then converting it back to
+                 * a Google Workspace file upon restore. The results of all these conversions are not pretty.
+                 */
+                if (googleDriveFile.mimeType.startsWith(GOOGLE_WORKSPACE_FILE_MIME_TYPE_PREFIX)) {
                     continue
                 }
 
@@ -443,6 +450,7 @@ class DriveFragment : Fragment() {
     }
 
 
+    // TODO: like we did for createDirectoryStructure(), make recursive method an inner method so we can have cleaner code.
     private suspend fun startRestoreProcedure(directoryBeingUploadedDocumentFile: DocumentFile, directoryBeingUploadedId: String) {
         val driveService = viewModel.viewState.value.googleDriveService!!
 
@@ -452,7 +460,7 @@ class DriveFragment : Fragment() {
                 true -> {
                     val fileMetadata = File().apply {
                         name = documentFileToUpload.name
-                        mimeType = "application/vnd.google-apps.folder"
+                        mimeType = DRIVE_FOLDER_MIME_TYPE
                         parents = Collections.singletonList(directoryBeingUploadedId)
                     }
 
@@ -706,7 +714,7 @@ class DriveFragment : Fragment() {
             .requestScopes(Scope(DriveScopes.DRIVE))
             .build()
 
-        return GoogleSignIn.getClient(requireActivity(), signInOptions);
+        return GoogleSignIn.getClient(requireActivity(), signInOptions)
     }
 
 
@@ -733,7 +741,7 @@ class DriveFragment : Fragment() {
 
 
     private fun getDriveService(googleAccount: GoogleSignInAccount?) {
-        val credential = GoogleAccountCredential.usingOAuth2(
+        credential = GoogleAccountCredential.usingOAuth2(
             requireActivity(), listOf(DriveScopes.DRIVE)
         )
         credential.selectedAccount = googleAccount?.account
@@ -744,7 +752,6 @@ class DriveFragment : Fragment() {
         ).setApplicationName(getString(R.string.app_name))
             .build()
 
-        this.credential = credential
         viewModel.updateGoogleDriveService(googleDriveService)
     }
 
@@ -773,8 +780,6 @@ class DriveFragment : Fragment() {
         private const val DRIVE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
         private const val GOOGLE_WORKSPACE_FILE_MIME_TYPE_PREFIX = "application/vnd.google-apps"
         private const val UNKNOWN_FILE_MIME_TYPE = "application/octet-stream"
-        private const val THIRD_PARTY_SHORTCUT_MIME_TYPE = "application/vnd.google-apps.drive-sdk"
-        private const val SHORTCUT_MIME_TYPE = "application/vnd.google-apps.shortcut"
         private const val FIVE_MEGABYTES_IN_BYTES = 5242880
         private const val CHUNK_SIZE_IN_BYTES = 33554432
     }
